@@ -6,6 +6,7 @@ pub mod auth_cli;
 pub mod clipboard;
 pub mod discovery;
 mod file_channel;
+pub mod file_feedback;
 pub mod handshake;
 mod http;
 pub mod message_center;

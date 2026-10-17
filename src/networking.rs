@@ -3,6 +3,7 @@ use crate::wire::{self, Field, message};
 use serde::Deserialize;
 
 pub const FILE_DISCOVERY: &str = "miLyraShare";
+pub const DEVICE_NAME: &str = "Clip";
 pub const FILE_TRANSFER: &str = "miLyraShareTransfer";
 pub const MAC_PACKAGE: &str = "com.xiaomi.hyperConnect";
 pub const PHONE_PACKAGE: &str = "com.miui.mishare.connectivity";

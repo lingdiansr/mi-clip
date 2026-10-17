@@ -4,13 +4,15 @@ use async_channel::Sender;
 use gpui_rhai::gpui::{
     App, AppContext, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
 };
+use mi_clip::file_feedback::{Event as FileEvent, Feedback, Icon};
 use objc2::rc::Retained;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSScreen, NSStatusBar,
-    NSStatusBarButton, NSStatusItem,
+    NSStatusBarButton, NSStatusItem, NSWorkspace,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSObjectProtocol, NSSize, ns_string};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Anchor {
@@ -21,6 +23,8 @@ pub(crate) enum TrayEvent {
     Toggle(Anchor),
     Close,
     Status(&'static str, String),
+    File(FileEvent),
+    AnimationTick,
     CheckUpdate,
     Update(crate::update_ui::Notice),
 }
@@ -63,6 +67,84 @@ struct StatusItem {
     _action: Retained<TrayAction>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+struct FileIcons {
+    // Generated only when a file event first occurs. Frames remain vector PDFs.
+    frames: Vec<(Icon, Vec<Retained<NSImage>>)>,
+}
+impl FileIcons {
+    fn new() -> Self {
+        Self { frames: Vec::new() }
+    }
+    fn image(&mut self, icon: Icon, frame: usize) -> anyhow::Result<&NSImage> {
+        if !self.frames.iter().any(|(kind, _)| *kind == icon) {
+            let count = if matches!(icon, Icon::Saved | Icon::Receiving) {
+                12
+            } else {
+                1
+            };
+            let images = (0..count)
+                .map(|frame| {
+                    let pdf = mi_clip::file_feedback::icon_pdf(icon, frame);
+                    let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&pdf))
+                        .ok_or_else(|| anyhow::anyhow!("Invalid file feedback icon"))?;
+                    image.setSize(NSSize::new(18., 18.));
+                    image.setTemplate(false);
+                    Ok(image)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            self.frames.push((icon, images));
+        }
+        let (_, images) = self.frames.iter().find(|(kind, _)| *kind == icon).unwrap();
+        Ok(&images[frame % images.len()])
+    }
+}
+
+fn schedule_frame(cx: &mut App, events: Sender<TrayEvent>, reduced_motion: bool) {
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(if reduced_motion {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(83)
+            })
+            .await;
+        let _ = events.send(TrayEvent::AnimationTick).await;
+    })
+    .detach();
+}
+
+fn render_feedback(
+    feedback: &Feedback,
+    icons: &mut FileIcons,
+    button: &NSStatusBarButton,
+    idle: &NSImage,
+    now: Duration,
+    reduced_motion: bool,
+) -> anyhow::Result<()> {
+    let (icon, mut frame, mut animated) = feedback.appearance(now);
+    if reduced_motion {
+        frame = 0;
+        animated = false;
+    }
+    if icon == Icon::Idle {
+        button.setImage(Some(idle));
+    } else {
+        button.setImage(Some(icons.image(icon, frame)?));
+    }
+    let alpha = if animated && matches!(icon, Icon::Connecting | Icon::Failed) {
+        0.75 + 0.25 * (frame as f64 * std::f64::consts::TAU / 12.).cos()
+    } else {
+        1.
+    };
+    button.setAlphaValue(alpha);
+    if let Some(detail) = feedback.detail() {
+        button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
+            "Mi Clip · {detail}"
+        ))));
+    }
+    Ok(())
+}
 impl Drop for StatusItem {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -78,10 +160,12 @@ pub fn install(
 ) -> anyhow::Result<()> {
     let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("main thread required"))?;
     let app = NSApplication::sharedApplication(mtm);
+    let reduced_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
     if !app.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
         anyhow::bail!("accessory activation policy rejected");
     }
     let (sender, receiver) = async_channel::bounded(32);
+    let testing = smoke.is_some();
     let action = TrayAction::new(mtm, sender.clone());
     let stop = runtime.stop.clone();
     if let Some(config) = config {
@@ -124,7 +208,7 @@ pub fn install(
             }
             if quitting.get() {
                 passed.set(true);
-                println!("PASS: native toggle, focused Escape after refresh, outside-close event, visible quit button and popup disposal");
+                println!("PASS: native file feedback frames, completion badge acknowledgement, toggle, Escape, outside-close event and Quit");
             }
             std::future::ready(())
         }).detach();
@@ -134,6 +218,53 @@ pub fn install(
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
                     .await;
+                // Synthetic lifecycle, no account, network, file write or OS banner.
+                cx.update(|_| -> anyhow::Result<()> {
+                    let mut frames = FileIcons::new();
+                    for icon in [Icon::Connecting, Icon::Receiving, Icon::Saved, Icon::Failed] {
+                        for frame in 0..12 {
+                            anyhow::ensure!(
+                                frames.image(icon, frame)?.isValid(),
+                                "Invalid native vector frame"
+                            );
+                        }
+                    }
+                    Ok(())
+                })?;
+                for event in [
+                    FileEvent::Requested,
+                    FileEvent::Failed(mi_clip::file_feedback::Failure::Unavailable),
+                    FileEvent::Requested,
+                    FileEvent::Progress {
+                        received: 4,
+                        total: 10,
+                    },
+                    FileEvent::Progress {
+                        received: 10,
+                        total: 10,
+                    },
+                    FileEvent::Saved { files: 1 },
+                ] {
+                    test_events.send(TrayEvent::File(event)).await?;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    cx.update(|_| -> anyhow::Result<()> {
+                        anyhow::ensure!(
+                            !test_button.image().is_none_or(|image| image.isTemplate()),
+                            "File event did not change native icon"
+                        );
+                        if matches!(event, FileEvent::Saved { .. }) {
+                            anyhow::ensure!(
+                                test_button
+                                    .toolTip()
+                                    .is_some_and(|text| text.to_string().contains("保存")),
+                                "Completion tooltip missing"
+                            );
+                        }
+                        Ok(())
+                    })?;
+                }
                 cx.update(|cx| -> anyhow::Result<()> {
                     anyhow::ensure!(cx.windows().is_empty(), "Unexpected startup window");
                     // SAFETY: Retained target and button, main thread.
@@ -147,6 +278,14 @@ pub fn install(
                         .timer(Duration::from_millis(700))
                         .await;
                     cx.update(|cx| -> anyhow::Result<()> {
+                        anyhow::ensure!(
+                            test_button.image().is_some_and(|image| image.isTemplate()),
+                            "Opening the panel did not acknowledge the badge"
+                        );
+                        anyhow::ensure!(
+                            test_button.alphaValue() == 1.,
+                            "Animation did not restore opacity"
+                        );
                         let handle = cx
                             .windows()
                             .first()
@@ -272,6 +411,11 @@ pub fn install(
     };
     cx.spawn(async move |cx| {
         let _status = status;
+        let clock = Instant::now();
+        let mut feedback = Feedback::default();
+        let mut file_icons = FileIcons::new();
+        let mut animation_pending = false;
+        let mut last_notification: Option<Instant> = None;
         let mut panel: Option<WindowHandle<Panel>> = None;
         let mut status_text = "尚未连接";
         let mut detail_text = "请先完成设备登录".to_owned();
@@ -326,13 +470,92 @@ pub fn install(
                         }
                         status_text = status;
                         detail_text = detail;
+                        let detail = feedback.detail().unwrap_or_else(|| detail_text.clone());
                         button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
-                            "Mi Clip · {status}"
+                            "Mi Clip · {status}{}",
+                            if detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {detail}")
+                            }
                         ))));
                         if let Some(opened) = panel.as_ref() {
                             let _ = opened.update(cx, |panel, window, cx| {
-                                panel.refresh(status_text, &detail_text, window, cx)
+                                panel.refresh(status_text, &detail, window, cx)
                             });
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::File(event) => {
+                        let changed = feedback.apply(event, clock.elapsed());
+                        if changed && std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
+                            if let Some(detail) = feedback.detail() {
+                                println!("Mi Clip file state: {detail}");
+                            }
+                        }
+                        if changed && !testing {
+                            match event {
+                                FileEvent::Requested
+                                    if last_notification.is_none_or(|last| {
+                                        last.elapsed() >= Duration::from_secs(15)
+                                    }) =>
+                                {
+                                    last_notification = Some(Instant::now());
+                                    crate::notifications::deliver(false);
+                                }
+                                FileEvent::Saved { .. } => crate::notifications::deliver(true),
+                                _ => (),
+                            }
+                        }
+                        render_feedback(
+                            &feedback,
+                            &mut file_icons,
+                            &button,
+                            &image,
+                            clock.elapsed(),
+                            reduced_motion,
+                        )?;
+                        if feedback.appearance(clock.elapsed()).2
+                            && (!reduced_motion || feedback.active())
+                            && !animation_pending
+                        {
+                            animation_pending = true;
+                            schedule_frame(cx, sender.clone(), reduced_motion);
+                        }
+                        if let Some(detail) = feedback.detail() {
+                            if let Some(opened) = panel.as_ref() {
+                                let _ = opened.update(cx, |panel, window, cx| {
+                                    panel.refresh(status_text, &detail, window, cx)
+                                });
+                            }
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::AnimationTick => {
+                        animation_pending = false;
+                        let changed = feedback.tick(clock.elapsed());
+                        if changed {
+                            if let (Some(detail), Some(opened)) =
+                                (feedback.detail(), panel.as_ref())
+                            {
+                                let _ = opened.update(cx, |panel, window, cx| {
+                                    panel.refresh(status_text, &detail, window, cx)
+                                });
+                            }
+                        }
+                        render_feedback(
+                            &feedback,
+                            &mut file_icons,
+                            &button,
+                            &image,
+                            clock.elapsed(),
+                            reduced_motion,
+                        )?;
+                        if feedback.appearance(clock.elapsed()).2
+                            && (!reduced_motion || feedback.active())
+                        {
+                            animation_pending = true;
+                            schedule_frame(cx, sender.clone(), reduced_motion);
                         }
                         return Ok(());
                     }
@@ -345,13 +568,14 @@ pub fn install(
                         return Ok(());
                     }
                 }
+                let detail = feedback.detail().unwrap_or_else(|| detail_text.clone());
                 // Rhai compilation and native popup allocation happen only on demand.
-                let prepared = ui::prepare_status(status_text, &detail_text)?;
+                let prepared = ui::prepare_status(status_text, &detail)?;
                 let opened = cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                             point(px(anchor.x), px(anchor.y)),
-                            ui::panel_size(&detail_text),
+                            ui::panel_size(&detail),
                         ))),
                         titlebar: None,
                         kind: WindowKind::Floating,
@@ -366,7 +590,7 @@ pub fn install(
                                 prepared,
                                 sender.clone(),
                                 update_text.clone(),
-                                &detail_text,
+                                &detail,
                                 window,
                                 cx,
                             )
@@ -376,6 +600,16 @@ pub fn install(
                 panel = Some(opened);
                 cx.activate(true);
                 opened.update(cx, |_, window, _| window.activate_window())?;
+                // Acknowledge only once the user can actually see the panel.
+                feedback.acknowledge();
+                render_feedback(
+                    &feedback,
+                    &mut file_icons,
+                    &button,
+                    &image,
+                    clock.elapsed(),
+                    reduced_motion,
+                )?;
                 Ok(())
             });
             if let Err(error) = result {

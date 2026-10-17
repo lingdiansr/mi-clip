@@ -94,7 +94,7 @@ pub(crate) fn sync_request_with_auth(
     info.extend(integer(3, 1));
     info.extend(message(4, &device_id.to_be_bytes()));
     info.extend(integer(5, 14));
-    info.extend(message(6, b"Mi Clip"));
+    info.extend(message(6, crate::networking::DEVICE_NAME.as_bytes()));
     info.extend(message(11, b"macOS standalone"));
     info.extend(message(12, &integer(1, 1)));
     let mut request = integer(1, now_ms);

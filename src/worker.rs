@@ -18,6 +18,10 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             let connected = std::cell::Cell::new(false);
             let _ = handshake::sync_once(&config, &stop, &|event| {
                 let status = match event {
+                    SyncEvent::File(event) => {
+                        let _ = events.send_blocking(TrayEvent::File(event));
+                        return;
+                    }
                     SyncEvent::Connected => {
                         connected.set(true);
                         ("已连接", String::new())
@@ -30,6 +34,9 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            let _ = events.try_send(TrayEvent::File(mi_clip::file_feedback::Event::Failed(
+                mi_clip::file_feedback::Failure::Disconnected,
+            )));
             if connected.get() {
                 backoff = 2;
             }

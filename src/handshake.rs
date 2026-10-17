@@ -98,7 +98,9 @@ fn networking_probe(
     key: &[u8; 32],
 ) -> anyhow::Result<Vec<u8>> {
     let did = URL_SAFE_NO_PAD.decode(&identity.did)?;
-    let mut device = message(1, b"Mi Clip");
+    let mut device = message(1, crate::networking::DEVICE_NAME.as_bytes());
+    // Supply real_device_name too, so peers can avoid a model-based fallback label.
+    device.extend(message(37, crate::networking::DEVICE_NAME.as_bytes()));
     device.extend(integer(2, 14));
     let device_id: String = did.iter().map(|b| format!("{b:02X}")).collect();
     let account_id: String = Sha256::digest(session.user_id.as_bytes())
@@ -547,6 +549,7 @@ pub enum SyncEvent {
     Received(usize),
     Sent(usize),
     Unsupported,
+    File(crate::file_feedback::Event),
 }
 
 pub fn probe(config: &Path, directory: &Path) -> anyhow::Result<()> {
@@ -657,13 +660,14 @@ fn exchange(
     let mut active_key = None;
     let mut peer_key = None;
     // File-channel support remains confined to the private interoperability probe.
-    let probe_files = directory.is_some()
-        && config.services.as_ref().is_some_and(|services| {
-            services.iter().any(|s| {
-                s.name == crate::networking::FILE_TRANSFER
-                    && s.package == crate::networking::MAC_PACKAGE
-            })
-        });
+    let file_advertised = config.services.as_ref().is_some_and(|services| {
+        services.iter().any(|s| {
+            s.name == crate::networking::FILE_TRANSFER
+                && s.package == crate::networking::MAC_PACKAGE
+        })
+    });
+    let probe_files = directory.is_some() && file_advertised;
+    let mut file_notice = None;
     let mut file_connection: Option<(u8, u32)> = None;
     anyhow::ensure!(
         !config.clipboard_sync || cfg!(feature = "clipboard"),
@@ -785,11 +789,29 @@ fn exchange(
         if let (Some(session_key), Ok(logical)) =
             (active_key.as_ref(), nested(&reply[4..], &[2, 1]))
         {
-            if probe_files {
+            if file_advertised {
                 if let Some(peer) = peer_key.as_ref() {
-                    if let Some(incoming) =
-                        crate::file_channel::incoming(logical, session_key, peer)?
-                    {
+                    // Invalid file proofs must not interrupt clipboard sync or
+                    // produce a trusted file notification in the resident app.
+                    let incoming = match crate::file_channel::incoming(logical, session_key, peer) {
+                        Ok(incoming) => incoming,
+                        Err(error) if probe_files => return Err(error),
+                        Err(_) => None,
+                    };
+                    if let Some(incoming) = incoming {
+                        let request = (incoming.peer_id, incoming.nonce);
+                        if file_notice != Some(request) {
+                            file_notice = Some(request);
+                            on_event(SyncEvent::File(crate::file_feedback::Event::Requested));
+                            if !probe_files {
+                                on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
+                                    crate::file_feedback::Failure::Unavailable,
+                                )));
+                            }
+                        }
+                        if !probe_files {
+                            continue;
+                        }
                         use base64::engine::general_purpose::STANDARD;
                         let signing = p256::ecdsa::SigningKey::from_slice(
                             &STANDARD.decode(&identity.private_key)?,
