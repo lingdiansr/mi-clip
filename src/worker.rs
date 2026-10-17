@@ -1,0 +1,50 @@
+use crate::tray::TrayEvent;
+use async_channel::Sender;
+use mi_clip::handshake::{self, SyncEvent};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut backoff = 2;
+        while !stop.load(Ordering::Relaxed) {
+            let _ = events.try_send(TrayEvent::Status("连接中", "请保持手机互联功能开启".into()));
+            let connected = std::cell::Cell::new(false);
+            let _ = handshake::sync_once(&config, &stop, &|event| {
+                let status = match event {
+                    SyncEvent::Connected => {
+                        connected.set(true);
+                        ("已连接", "双向文本 · 最多 3 KiB".into())
+                    }
+                    SyncEvent::Received(bytes) => ("同步中", format!("手机 → Mac · {bytes} 字节")),
+                    SyncEvent::Sent(bytes) => ("同步中", format!("Mac → 手机 · {bytes} 字节")),
+                    SyncEvent::Unsupported => ("已连接", "已跳过超出长度限制的内容".into()),
+                };
+                let _ = events.try_send(TrayEvent::Status(status.0, status.1));
+            });
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if connected.get() {
+                backoff = 2;
+            }
+            let _ = events.try_send(TrayEvent::Status(
+                "等待重连",
+                "手机离线或认证失效 · 自动重试".into(),
+            ));
+            for _ in 0..backoff * 4 {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            backoff = (backoff * 2).min(30);
+        }
+    });
+}

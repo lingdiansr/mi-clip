@@ -1,0 +1,382 @@
+//! The only native UI bridge: an NSStatusItem with an event-driven Rust action.
+use crate::ui::{self, Panel};
+use async_channel::Sender;
+use gpui_rhai::gpui::{
+    App, AppContext, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
+};
+use objc2::rc::Retained;
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSImage, NSScreen, NSStatusBar,
+    NSStatusBarButton, NSStatusItem,
+};
+use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSObjectProtocol, NSSize, ns_string};
+
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor {
+    x: f32,
+    y: f32,
+}
+pub(crate) enum TrayEvent {
+    Toggle(Anchor),
+    Close,
+    Status(&'static str, String),
+    CheckUpdate,
+    Update(crate::update_ui::Notice),
+}
+struct ActionState {
+    events: Sender<TrayEvent>,
+}
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ActionState]
+    struct TrayAction;
+    unsafe impl NSObjectProtocol for TrayAction {}
+    impl TrayAction {
+        #[unsafe(method(togglePanel:))]
+        fn toggle_panel(&self, sender: &NSStatusBarButton) {
+            if let Some(window) = sender.window() {
+                let rect = window.frame();
+                let screens = NSScreen::screens(self.mtm());
+                let main_height = screens.firstObject().map(|s| s.frame().size.height).unwrap_or(0.0);
+                let screen_left = window.screen().map(|s| s.frame().origin.x).unwrap_or(0.0);
+                let anchor = Anchor {
+                    x: ((rect.origin.x + rect.size.width - 320.0).max(screen_left + 4.0)) as f32,
+                    y: (main_height - rect.origin.y + 4.0) as f32,
+                };
+                // A bounded channel coalesces repeated clicks without timers or busy polling.
+                let _ = self.ivars().events.try_send(TrayEvent::Toggle(anchor));
+            }
+        }
+    }
+);
+impl TrayAction {
+    fn new(mtm: MainThreadMarker, events: Sender<TrayEvent>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ActionState { events });
+        // SAFETY: NSObject's initializer is valid for this subclass.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+struct StatusItem {
+    item: Retained<NSStatusItem>,
+    _action: Retained<TrayAction>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for StatusItem {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        NSStatusBar::systemStatusBar().removeStatusItem(&self.item);
+    }
+}
+
+pub fn install(
+    cx: &mut App,
+    smoke: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    config: Option<std::path::PathBuf>,
+    runtime: crate::Runtime,
+) -> anyhow::Result<()> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("main thread required"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    if !app.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
+        anyhow::bail!("accessory activation policy rejected");
+    }
+    let (sender, receiver) = async_channel::bounded(32);
+    let action = TrayAction::new(mtm, sender.clone());
+    let stop = runtime.stop.clone();
+    if let Some(config) = config {
+        crate::worker::start(config, sender.clone(), stop.clone());
+    }
+    let update_request = if smoke.is_none() {
+        Some(crate::update_ui::start(sender.clone(), stop.clone()))
+    } else {
+        None
+    };
+    let item = NSStatusBar::systemStatusBar().statusItemWithLength(28.0);
+    let button = item
+        .button(mtm)
+        .ok_or_else(|| anyhow::anyhow!("status button unavailable"))?;
+    let image = NSImage::initWithData(
+        NSImage::alloc(),
+        &NSData::with_bytes(include_bytes!("../assets/status-template.pdf")),
+    )
+    .ok_or_else(|| anyhow::anyhow!("invalid embedded icon"))?;
+    image.setSize(NSSize::new(18.0, 18.0));
+    image.setTemplate(true);
+    button.setImage(Some(&image));
+    button.setToolTip(Some(ns_string!("Mi Clip · 尚未连接")));
+    // SAFETY: The target is retained for the entire event loop. Selector signature
+    // matches the action method above; Cocoa supplies the status button as sender.
+    unsafe {
+        button.setTarget(Some(&action));
+        button.setAction(Some(sel!(togglePanel:)));
+    }
+    mi_clip::updater::mark_ready()?;
+    if let Some(passed) = smoke {
+        let test_button = button.clone();
+        let test_events = sender.clone();
+        let quit_expected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let quitting = quit_expected.clone();
+        cx.on_app_quit(move |_| {
+            if !quitting.get() {
+                eprintln!("UI smoke test ended before the Quit button was clicked");
+                std::process::exit(1);
+            }
+            if quitting.get() {
+                passed.set(true);
+                println!("PASS: native toggle, focused Escape after refresh, outside-close event, visible close/quit buttons and popup disposal");
+            }
+            std::future::ready(())
+        }).detach();
+        cx.spawn(async move |cx| {
+            use std::time::Duration;
+            let result = async {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                cx.update(|cx| -> anyhow::Result<()> {
+                    anyhow::ensure!(cx.windows().is_empty(), "Unexpected startup window");
+                    // SAFETY: Retained target and button, main thread.
+                    unsafe {
+                        test_button.performClick(None);
+                    }
+                    Ok(())
+                })?;
+                for step in 0..5 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(700))
+                        .await;
+                    cx.update(|cx| -> anyhow::Result<()> {
+                        let handle = cx
+                            .windows()
+                            .first()
+                            .copied()
+                            .and_then(|w| w.downcast::<Panel>())
+                            .ok_or_else(|| anyhow::anyhow!("Popup missing before refresh"))?;
+                        handle.update(cx, |panel, window, cx| {
+                            panel.refresh("已连接", "测试状态更新", window, cx)
+                        })??;
+                        Ok(())
+                    })?;
+                    // Let the new Rhai tree commit its focus path and hitboxes.
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    cx.update(|cx| -> anyhow::Result<()> {
+                        use gpui_rhai::gpui::{
+                            Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
+                        };
+                        anyhow::ensure!(cx.windows().len() == 1, "Click must open one popup");
+                        let handle = cx.windows()[0]
+                            .downcast::<Panel>()
+                            .ok_or_else(|| anyhow::anyhow!("Wrong root"))?;
+                        handle.update(cx, |panel, window, cx| -> anyhow::Result<()> {
+                            panel.validate(cx)?;
+                            let _ = window;
+                            Ok(())
+                        })??;
+                        cx.update_window(handle.into(), |_, window, cx| -> anyhow::Result<()> {
+                            if step == 1 {
+                                window.dispatch_keystroke(Keystroke::parse("escape")?, cx);
+                            } else if step == 2 || step == 4 {
+                                // Real GPUI hit testing at the footer, not a direct callback.
+                                let position =
+                                    point(px(if step == 2 { 232.0 } else { 284.0 }), px(156.0));
+                                window.dispatch_event(
+                                    PlatformInput::MouseMove(gpui_rhai::gpui::MouseMoveEvent {
+                                        position,
+                                        ..Default::default()
+                                    }),
+                                    cx,
+                                );
+                                window.dispatch_event(
+                                    PlatformInput::MouseDown(MouseDownEvent {
+                                        button: MouseButton::Left,
+                                        position,
+                                        click_count: 1,
+                                        ..Default::default()
+                                    }),
+                                    cx,
+                                );
+                                window.dispatch_event(
+                                    PlatformInput::MouseUp(MouseUpEvent {
+                                        button: MouseButton::Left,
+                                        position,
+                                        click_count: 1,
+                                        ..Default::default()
+                                    }),
+                                    cx,
+                                );
+                            }
+                            Ok(())
+                        })??;
+                        if step == 0 {
+                            unsafe {
+                                test_button.performClick(None);
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    if step == 3 {
+                        // Exercise the event sent by the native mouse monitor.
+                        // macOS may deny activation to an automated background
+                        // launch, so do not infer an outside click from keyWindow.
+                        test_events.try_send(TrayEvent::Close)?;
+                    }
+                    if step == 4 {
+                        // The click must itself request application quit. A timed
+                        // cleanup is a failure and cannot mark this test passed.
+                        cx.background_executor()
+                            .timer(Duration::from_millis(400))
+                            .await;
+                        anyhow::bail!("Visible Quit button did not quit the application");
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(300))
+                        .await;
+                    cx.update(|cx| -> anyhow::Result<()> {
+                        anyhow::ensure!(
+                            cx.windows().is_empty(),
+                            "Close path {step} left a popup open"
+                        );
+                        if step == 3 {
+                            quit_expected.set(true);
+                        }
+                        unsafe {
+                            test_button.performClick(None);
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            quit_expected.set(false);
+            if let Err(error) = result {
+                eprintln!("UI smoke test failed: {error}");
+                std::process::exit(1);
+            }
+            let _ = cx.update(|cx| {
+                cx.quit();
+                Ok::<(), anyhow::Error>(())
+            });
+        })
+        .detach();
+    }
+    if std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
+        println!("Mi Clip status item ready; no startup window.");
+    }
+    let status = StatusItem {
+        item,
+        _action: action,
+        stop,
+    };
+    cx.spawn(async move |cx| {
+        let _status = status;
+        let mut panel: Option<WindowHandle<Panel>> = None;
+        let mut status_text = "尚未连接";
+        let mut detail_text = "请先完成设备登录".to_owned();
+        let mut update_text = if std::env::var_os("MICLIP_UPDATE_ROLLBACK").is_some() {
+            "更新失败，重试".to_owned()
+        } else {
+            "检查更新".to_owned()
+        };
+        while let Ok(event) = receiver.recv().await {
+            let result = cx.update(|cx| -> anyhow::Result<()> {
+                let anchor = match event {
+                    TrayEvent::Toggle(anchor) => anchor,
+                    TrayEvent::Close => {
+                        if let Some(opened) = panel.take() {
+                            let _ = opened.update(cx, |_, window, _| window.remove_window());
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::CheckUpdate => {
+                        if runtime.update.lock().unwrap().is_some() {
+                            runtime
+                                .install_update
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            cx.quit();
+                        } else if let Some(request) = &update_request {
+                            let _ = request.try_send(());
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::Update(notice) => {
+                        use crate::update_ui::Notice;
+                        update_text = match notice {
+                            Notice::Checking => "检查中…".into(),
+                            Notice::Current => "已是最新版本".into(),
+                            Notice::Unpublished => "更新尚未发布".into(),
+                            Notice::Failed => "重试检查更新".into(),
+                            Notice::Ready(update) => {
+                                let text = format!("更新至 {}", update.version());
+                                *runtime.update.lock().unwrap() = Some(update);
+                                text
+                            }
+                        };
+                        if let Some(opened) = panel.as_ref() {
+                            let _ = opened
+                                .update(cx, |panel, _, cx| panel.update_label(&update_text, cx));
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::Status(status, detail) => {
+                        if std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
+                            println!("Mi Clip state: {status}; {detail}");
+                        }
+                        status_text = status;
+                        detail_text = detail;
+                        button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
+                            "Mi Clip · {status}"
+                        ))));
+                        if let Some(opened) = panel.as_ref() {
+                            let _ = opened.update(cx, |panel, window, cx| {
+                                panel.refresh(status_text, &detail_text, window, cx)
+                            });
+                        }
+                        return Ok(());
+                    }
+                };
+                if let Some(existing) = panel.take() {
+                    if existing
+                        .update(cx, |_, window, _| window.remove_window())
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                // Rhai compilation and native popup allocation happen only on demand.
+                let prepared = ui::prepare_status(status_text, &detail_text)?;
+                let opened = cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(anchor.x), px(anchor.y)),
+                            size(px(320.0), px(180.0)),
+                        ))),
+                        titlebar: None,
+                        kind: WindowKind::Floating,
+                        is_resizable: false,
+                        is_minimizable: false,
+                        is_movable: false,
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        cx.new(|cx| {
+                            Panel::new(prepared, sender.clone(), update_text.clone(), window, cx)
+                        })
+                    },
+                )?;
+                panel = Some(opened);
+                cx.activate(true);
+                opened.update(cx, |_, window, _| window.activate_window())?;
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("Panel unavailable: {error}");
+            }
+        }
+    })
+    .detach();
+    Ok(())
+}

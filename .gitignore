@@ -1,0 +1,20 @@
+# Publish only reviewed source, synthetic tests and these named assets.
+*
+!/.gitignore
+!/Cargo.toml
+!/Cargo.lock
+!/README.txt
+!/src/
+!/src/*.rs
+!/src/bin/
+!/src/bin/*.rs
+!/ui/
+!/ui/*.rhai
+!/assets/
+!/assets/status-template.svg
+!/assets/status-template.pdf
+!/tools/
+!/tools/generate_icon.py
+!/tools/build-release.sh
+!/tests/
+!/tests/*.py

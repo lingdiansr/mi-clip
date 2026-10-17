@@ -1,0 +1,55 @@
+[package]
+name = "mi-clip"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[features]
+default = ["ui"]
+ui = ["dep:gpui-rhai", "dep:async-channel", "dep:block2", "clipboard"]
+clipboard = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
+research = ["clipboard"]
+
+[[bin]]
+name = "mi-clip"
+path = "src/main.rs"
+required-features = ["ui"]
+
+[[bin]]
+name = "mi-clip-auth"
+path = "src/bin/auth.rs"
+required-features = ["research"]
+
+[dependencies]
+aes-gcm = "0.10.3"
+base64 = "0.22"
+p256 = { version = "0.13.2", default-features = false, features = ["std", "ecdsa", "pkcs8", "ecdh"] }
+sha1 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2.5"
+qrcode = { version = "0.14", default-features = false }
+png = "0.17"
+
+gpui-rhai = { version = "=0.2.2", default-features = false, optional = true }
+block2 = { version = "0.6.2", optional = true }
+async-channel = { version = "2.5", optional = true }
+anyhow = "1"
+objc2 = { version = "0.6.4", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSObject", "NSString", "NSData", "NSGeometry"] }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSPasteboard", "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSImage", "NSButton", "NSControl", "NSView", "NSResponder", "NSWindow", "NSScreen", "NSRunningApplication", "NSEvent", "block2"] }
+x509-cert = { version = "0.2.5", features = ["pem"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+debug = 0
+
+[profile.dev.package.rhai]
+opt-level = 1
