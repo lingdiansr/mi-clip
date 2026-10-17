@@ -13,18 +13,38 @@ pub fn prepare() -> anyhow::Result<PreparedScriptView> {
 }
 pub fn prepare_status(status: &str, detail: &str) -> anyhow::Result<PreparedScriptView> {
     let id = ModuleId::parse("panel")?;
+    let online = matches!(status, "已连接" | "已联机" | "同步中");
     Ok(EmbeddedScriptView::new(
         id.clone(),
         EmbeddedScriptSource::new(BTreeMap::from([(
             id,
             include_str!("../ui/panel.rhai")
-                .replace("\"尚未连接\"", &serde_json::to_string(status)?)
+                .replace(
+                    "\"尚未连接\"",
+                    &serde_json::to_string(if online { "✓" } else { status })?,
+                )
+                .replace(
+                    "\"status_color\"",
+                    if online {
+                        "\"success\""
+                    } else {
+                        "\"text_muted\""
+                    },
+                )
                 .replace("\"等待设备认证\"", &serde_json::to_string(detail)?),
         )])),
         include_str!("../ui/theme.rhai"),
     )
     .prepare()
     .map_err(|error| anyhow::anyhow!(error.to_string()))?)
+}
+
+fn content_height(detail: &str) -> f32 {
+    if detail.is_empty() { 48.0 } else { 72.0 }
+}
+pub const PANEL_WIDTH: f32 = 280.0;
+pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels> {
+    gpui_rhai::gpui::size(px(PANEL_WIDTH), px(content_height(detail) + 40.0))
 }
 
 pub struct Panel {
@@ -34,6 +54,7 @@ pub struct Panel {
     _outside_click: OutsideClickMonitor,
     events: async_channel::Sender<crate::tray::TrayEvent>,
     update_label: String,
+    content_height: f32,
 }
 impl Panel {
     pub fn update_label(&mut self, label: &str, cx: &mut Context<Self>) {
@@ -48,6 +69,8 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let prepared = prepare_status(status, detail)?;
+        self.content_height = content_height(detail);
+        window.resize(panel_size(detail));
         if let Ok(view) = &self.view {
             let _ = view.dispose(cx);
         }
@@ -92,6 +115,7 @@ impl Panel {
         prepared: PreparedScriptView,
         events: async_channel::Sender<crate::tray::TrayEvent>,
         update_label: String,
+        detail: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -115,6 +139,7 @@ impl Panel {
             _outside_click: outside_click,
             events,
             update_label,
+            content_height: content_height(detail),
         }
     }
 }
@@ -166,6 +191,7 @@ impl Render for Panel {
                 .flex_col()
                 .bg(rgba(0x191b20ff))
                 .text_color(rgba(0xf0f2f5ff))
+                .text_size(px(12.0))
                 .on_action(|_: &crate::ClosePanel, window, _| window.remove_window())
                 .on_key_down(|event, window, _| {
                     if event.keystroke.key == "escape" {
@@ -176,14 +202,14 @@ impl Render for Panel {
                 // the content area instead of letting it push buttons offscreen.
                 .child(
                     div()
-                        .h(px(132.0))
+                        .h(px(self.content_height))
                         .flex_shrink_0()
                         .overflow_hidden()
                         .child(content),
                 )
                 .child(
                     div()
-                        .h(px(48.0))
+                        .h(px(40.0))
                         .flex_shrink_0()
                         .flex()
                         .items_center()
@@ -208,32 +234,15 @@ impl Render for Panel {
                         )
                         .child(
                             div()
-                                .flex()
-                                .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .id("close")
-                                        .px(px(8.0))
-                                        .py(px(6.0))
-                                        .text_size(px(12.0))
-                                        .rounded(px(6.0))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgba(0x2b3038ff)))
-                                        .on_click(|_, window, _| window.remove_window())
-                                        .child("关闭"),
-                                )
-                                .child(
-                                    div()
-                                        .id("quit")
-                                        .px(px(8.0))
-                                        .py(px(6.0))
-                                        .text_size(px(12.0))
-                                        .rounded(px(6.0))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgba(0x2b3038ff)))
-                                        .on_click(|_, _, cx| cx.quit())
-                                        .child("退出"),
-                                ),
+                                .id("quit")
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .text_size(px(12.0))
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0x2b3038ff)))
+                                .on_click(|_, _, cx| cx.quit())
+                                .child("退出"),
                         ),
                 ),
         )

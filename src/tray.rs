@@ -2,7 +2,7 @@
 use crate::ui::{self, Panel};
 use async_channel::Sender;
 use gpui_rhai::gpui::{
-    App, AppContext, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px, size,
+    App, AppContext, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
 };
 use objc2::rc::Retained;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
@@ -42,7 +42,7 @@ define_class!(
                 let main_height = screens.firstObject().map(|s| s.frame().size.height).unwrap_or(0.0);
                 let screen_left = window.screen().map(|s| s.frame().origin.x).unwrap_or(0.0);
                 let anchor = Anchor {
-                    x: ((rect.origin.x + rect.size.width - 320.0).max(screen_left + 4.0)) as f32,
+                    x: ((rect.origin.x + rect.size.width - f64::from(ui::PANEL_WIDTH)).max(screen_left + 4.0)) as f32,
                     y: (main_height - rect.origin.y + 4.0) as f32,
                 };
                 // A bounded channel coalesces repeated clicks without timers or busy polling.
@@ -124,7 +124,7 @@ pub fn install(
             }
             if quitting.get() {
                 passed.set(true);
-                println!("PASS: native toggle, focused Escape after refresh, outside-close event, visible close/quit buttons and popup disposal");
+                println!("PASS: native toggle, focused Escape after refresh, outside-close event, visible quit button and popup disposal");
             }
             std::future::ready(())
         }).detach();
@@ -142,7 +142,7 @@ pub fn install(
                     }
                     Ok(())
                 })?;
-                for step in 0..5 {
+                for step in 0..4 {
                     cx.background_executor()
                         .timer(Duration::from_millis(700))
                         .await;
@@ -178,10 +178,9 @@ pub fn install(
                         cx.update_window(handle.into(), |_, window, cx| -> anyhow::Result<()> {
                             if step == 1 {
                                 window.dispatch_keystroke(Keystroke::parse("escape")?, cx);
-                            } else if step == 2 || step == 4 {
+                            } else if step == 3 {
                                 // Real GPUI hit testing at the footer, not a direct callback.
-                                let position =
-                                    point(px(if step == 2 { 232.0 } else { 284.0 }), px(156.0));
+                                let position = point(px(244.0), px(92.0));
                                 window.dispatch_event(
                                     PlatformInput::MouseMove(gpui_rhai::gpui::MouseMoveEvent {
                                         position,
@@ -217,13 +216,13 @@ pub fn install(
                         }
                         Ok(())
                     })?;
-                    if step == 3 {
+                    if step == 2 {
                         // Exercise the event sent by the native mouse monitor.
                         // macOS may deny activation to an automated background
                         // launch, so do not infer an outside click from keyWindow.
                         test_events.try_send(TrayEvent::Close)?;
                     }
-                    if step == 4 {
+                    if step == 3 {
                         // The click must itself request application quit. A timed
                         // cleanup is a failure and cannot mark this test passed.
                         cx.background_executor()
@@ -239,7 +238,7 @@ pub fn install(
                             cx.windows().is_empty(),
                             "Close path {step} left a popup open"
                         );
-                        if step == 3 {
+                        if step == 2 {
                             quit_expected.set(true);
                         }
                         unsafe {
@@ -352,7 +351,7 @@ pub fn install(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                             point(px(anchor.x), px(anchor.y)),
-                            size(px(320.0), px(180.0)),
+                            ui::panel_size(&detail_text),
                         ))),
                         titlebar: None,
                         kind: WindowKind::Floating,
@@ -363,7 +362,14 @@ pub fn install(
                     },
                     |window, cx| {
                         cx.new(|cx| {
-                            Panel::new(prepared, sender.clone(), update_text.clone(), window, cx)
+                            Panel::new(
+                                prepared,
+                                sender.clone(),
+                                update_text.clone(),
+                                &detail_text,
+                                window,
+                                cx,
+                            )
                         })
                     },
                 )?;

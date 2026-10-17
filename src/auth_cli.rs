@@ -1,6 +1,25 @@
 use crate::account;
 use std::path::Path;
 pub fn run(a: &[String]) -> anyhow::Result<()> {
+    if a.len() == 4 && a[0] == "verify-file-request" {
+        return crate::handshake::verify_file_request(
+            Path::new(&a[1]),
+            Path::new(&a[2]),
+            Path::new(&a[3]),
+        );
+    }
+    if a.len() == 2 && a[0] == "inspect-services" {
+        let bytes = std::fs::read(&a[1])?;
+        let peer = crate::networking::peer(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("Unsupported device capability message"))?;
+        println!(
+            "Authenticated device capabilities: type {}; {} services; native file sharing: {}. No device names or identifiers printed.",
+            peer.device_type,
+            peer.services.len(),
+            peer.can_share_files()
+        );
+        return Ok(());
+    }
     if a.len() == 2 && a[0] == "apply-payload" {
         let bytes = std::fs::read(&a[1])?;
         let text = crate::message_center::payload_text(&bytes).ok_or_else(|| {

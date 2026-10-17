@@ -20,10 +20,9 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                 let status = match event {
                     SyncEvent::Connected => {
                         connected.set(true);
-                        ("已连接", "双向文本 · 最多 3 KiB".into())
+                        ("已连接", String::new())
                     }
-                    SyncEvent::Received(bytes) => ("同步中", format!("手机 → Mac · {bytes} 字节")),
-                    SyncEvent::Sent(bytes) => ("同步中", format!("Mac → 手机 · {bytes} 字节")),
+                    SyncEvent::Received(_) | SyncEvent::Sent(_) => ("已连接", String::new()),
                     SyncEvent::Unsupported => ("已连接", "已跳过超出长度限制的内容".into()),
                 };
                 let _ = events.try_send(TrayEvent::Status(status.0, status.1));

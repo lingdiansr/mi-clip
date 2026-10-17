@@ -4,6 +4,9 @@
 !/Cargo.toml
 !/Cargo.lock
 !/README.txt
+!/.github/
+!/.github/workflows/
+!/.github/workflows/release.yml
 !/src/
 !/src/*.rs
 !/src/bin/

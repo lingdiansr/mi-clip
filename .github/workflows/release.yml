@@ -1,0 +1,212 @@
+name: Release macOS binaries
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check tag matches Cargo version
+        id: version
+        shell: python
+        run: |
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ['RELEASE_TAG']
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
+              raise SystemExit('Use a stable version tag such as v0.2.0.')
+          if tag != f'v{version}':
+              raise SystemExit('Tag must match package.version in Cargo.toml.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+      - name: Require release secrets before building
+        env:
+          MI_CLIP_SIGNING_KEY: ${{ secrets.MI_CLIP_SIGNING_KEY }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          if [ -z "$MI_CLIP_SIGNING_KEY" ]; then
+            echo 'Configure the repository MI_CLIP_SIGNING_KEY secret before releasing.' >&2
+            exit 1
+          fi
+          if [ -z "$FEISHU_WEBHOOK_URL" ]; then
+            echo 'Configure the repository FEISHU_WEBHOOK_URL secret before releasing.' >&2
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      RELEASE_ARCH: ${{ matrix.arch }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      MI_CLIP_UPDATE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Test protocol and updater
+        run: cargo test --locked --no-default-features --features research --lib
+      - name: Build optimized binary
+        run: sh tools/build-release.sh --bin mi-clip
+      - name: Validate UI scripts and synthetic peer
+        run: |
+          target/release/mi-clip --check-ui
+          python3 tests/probe_test.py target/release/mi-clip
+      - name: Sign and independently verify update assets
+        env:
+          MI_CLIP_SIGNING_KEY: ${{ secrets.MI_CLIP_SIGNING_KEY }}
+        run: |
+          umask 077
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/miclip-signing.XXXXXX")
+          export SIGNING_DIR="$signing_dir"
+          trap 'rm -rf "$signing_dir"' EXIT
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['SIGNING_DIR'])
+          try:
+              key = base64.b64decode(os.environ['MI_CLIP_SIGNING_KEY'], validate=True)
+          except (ValueError, KeyError):
+              raise SystemExit('Configure MI_CLIP_SIGNING_KEY as a Base64-encoded 32-byte P-256 release key.') from None
+          if len(key) != 32:
+              raise SystemExit('MI_CLIP_SIGNING_KEY must contain exactly 32 decoded bytes.')
+          (root / 'signing.key').write_bytes(key)
+          config = {
+              'version': os.environ['RELEASE_VERSION'],
+              'arch': os.environ['RELEASE_ARCH'],
+              'repository': os.environ['MI_CLIP_UPDATE_REPOSITORY'],
+              'binary': str(Path('target/release/mi-clip').resolve()),
+              'private_key': str(root / 'signing.key'),
+          }
+          (root / 'release.json').write_text(json.dumps(config))
+          PY
+          mkdir -p release-assets
+          target/release/mi-clip --auth sign-update "$signing_dir/release.json" release-assets
+          python3 tests/update_signature_test.py \
+            "release-assets/manifest-macos-${RELEASE_ARCH}.json" \
+            "release-assets/mi-clip-macos-${RELEASE_ARCH}"
+          (cd release-assets && shasum -a 256 "mi-clip-macos-${RELEASE_ARCH}" > "mi-clip-macos-${RELEASE_ARCH}.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish both architectures together
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          for arch in x86_64 aarch64; do
+            test -s "release-assets/mi-clip-macos-${arch}"
+            test -s "release-assets/manifest-macos-${arch}.json"
+            (cd release-assets && sha256sum -c "mi-clip-macos-${arch}.sha256")
+          done
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "Mi Clip $RELEASE_TAG" --draft
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
+      - name: Notify Feishu of published release
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        shell: python
+        run: |
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          webhook = os.environ.get('FEISHU_WEBHOOK_URL')
+          if not webhook:
+              raise SystemExit('Configure the repository FEISHU_WEBHOOK_URL secret before releasing.')
+
+          server = os.environ['GITHUB_SERVER_URL']
+          repository = os.environ['GITHUB_REPOSITORY']
+          tag = os.environ['RELEASE_TAG']
+          release_url = f"{server}/{repository}/releases/tag/{urllib.parse.quote(tag, safe='')}"
+          run_url = f"{server}/{repository}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          payload = {
+              'msg_type': 'text',
+              'content': {
+                  'text': (
+                      f'Mi Clip {tag} 已编译并发布成功\n'
+                      '支持 macOS Apple Silicon 和 Intel\n'
+                      f'下载地址：{release_url}\n'
+                      f'构建记录：{run_url}'
+                  ),
+              },
+          }
+          try:
+              request = urllib.request.Request(
+                  webhook,
+                  data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'},
+                  method='POST',
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+          except (urllib.error.URLError, TimeoutError, ValueError):
+              raise SystemExit('Feishu notification failed: HTTP, network or invalid JSON response.') from None
+          if not isinstance(result, dict) or result.get('code', result.get('StatusCode')) != 0:
+              raise SystemExit('Feishu rejected the release notification; check the bot settings.')
+          print('Feishu release notification sent.')

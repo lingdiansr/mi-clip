@@ -60,6 +60,22 @@ fn logical_encrypted(
     session_key: &[u8; 32],
     inner: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
+    let incoming = nested(reply, &[2, 1])?;
+    logical_packet(
+        number(incoming, 2)?,
+        number(incoming, 1)?,
+        number(incoming, 3)?,
+        session_key,
+        inner,
+    )
+}
+fn logical_packet(
+    source: u64,
+    destination: u64,
+    nonce: u64,
+    session_key: &[u8; 32],
+    inner: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let iv = private::random::<12>()?;
     let mut encrypted = iv.to_vec();
     encrypted.extend(
@@ -68,10 +84,9 @@ fn logical_encrypted(
             .encrypt(Nonce::from_slice(&iv), inner)
             .map_err(|_| anyhow::anyhow!("Logical message encryption failed"))?,
     );
-    let incoming = nested(reply, &[2, 1])?;
-    let mut logical = integer(1, number(incoming, 2)?);
-    logical.extend(integer(2, number(incoming, 1)?));
-    logical.extend(integer(3, number(incoming, 3)?));
+    let mut logical = integer(1, source);
+    logical.extend(integer(2, destination));
+    logical.extend(integer(3, nonce));
     logical.extend(integer(4, 1));
     logical.extend(message(5, &encrypted));
     frame(17, &message(2, &message(1, &logical)))
@@ -98,10 +113,12 @@ fn networking_probe(
     device.extend(integer(21, 128));
     device.extend(message(23, device_id.as_bytes()));
     device.extend(integer(10, 5));
-    let mut clipboard_service = message(1, b"universalClipboard");
-    clipboard_service.extend(message(2, b"com.milink.service"));
-    clipboard_service.extend(message(3, &[0]));
-    device.extend(message(14, &clipboard_service));
+    let default_services = vec![crate::networking::Service::clipboard()];
+    let services = config.services.as_ref().unwrap_or(&default_services);
+    anyhow::ensure!(services.len() <= 8, "Too many advertised services");
+    for service in services {
+        device.extend(message(14, &service.encode()?));
+    }
     // The networking registry separately checks proof of account membership.
     // Sign a fresh challenge with our enrolled key, never a vendor-owned key.
     use base64::engine::general_purpose::STANDARD;
@@ -201,7 +218,7 @@ fn client_finished(
     secret: &SecretKey,
     reply: &[u8],
     info: &[u8],
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(Vec<u8>, p256::ecdsa::VerifyingKey)> {
     use base64::engine::general_purpose::STANDARD;
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use x509_cert::der::{DecodePem, Encode};
@@ -216,7 +233,7 @@ fn client_finished(
         .decrypt(Nonce::from_slice(&encrypted[..12]), &encrypted[12..])
         .map_err(|_| anyhow::anyhow!("Peer credential GCM verification failed"))?;
     let client_public = secret.public_key().to_encoded_point(false);
-    verify_credential(
+    let peer_key = verify_credential(
         &credential,
         &std::fs::read(&config.account_certificate)?,
         &session.user_id,
@@ -260,7 +277,7 @@ fn client_finished(
     logical.extend(integer(2, number(incoming, 1)?));
     logical.extend(integer(3, number(incoming, 3)?));
     logical.extend(message(5, &inner));
-    frame(17, &message(2, &message(1, &logical)))
+    Ok((frame(17, &message(2, &message(1, &logical)))?, peer_key))
 }
 pub fn inspect(directory: &Path, output: &Path) -> anyhow::Result<()> {
     let secret = SecretKey::from_slice(&std::fs::read(directory.join("ephemeral-key.bin"))?)?;
@@ -341,6 +358,8 @@ struct ProbeConfig {
     listen_seconds: Option<u64>,
     #[serde(default)]
     clipboard_sync: bool,
+    #[serde(default)]
+    services: Option<Vec<crate::networking::Service>>,
 }
 fn default_endpoint() -> SocketAddr {
     ([0, 0, 0, 0], 0).into()
@@ -360,7 +379,7 @@ fn verify_credential(
     peer_type: u64,
     server_public: &[u8],
     client_public: &[u8],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<p256::ecdsa::VerifyingKey> {
     use p256::ecdsa::{Signature, signature::Verifier};
     use x509_cert::der::{Decode, DecodePem, Encode};
     let cert = x509_cert::Certificate::from_der(nested(credential, &[1])?)?;
@@ -428,7 +447,7 @@ fn verify_credential(
     certificate_key(&cert)?
         .verify(&signed, &Signature::from_der(nested(credential, &[2])?)?)
         .map_err(|_| anyhow::anyhow!("Peer ephemeral-key signature verification failed"))?;
-    Ok(())
+    certificate_key(&cert)
 }
 pub fn verify(config: &Path, directory: &Path) -> anyhow::Result<()> {
     let config: ProbeConfig = serde_json::from_slice(&std::fs::read(config)?)?;
@@ -465,6 +484,55 @@ pub fn verify(config: &Path, directory: &Path) -> anyhow::Result<()> {
     )?;
     println!(
         "Independent Rust verification passed: account-issued certificate, validity, same account/device and signed ephemeral keys."
+    );
+    Ok(())
+}
+
+/// Replay a privately saved request without contacting the phone or opening a port.
+pub fn verify_file_request(config: &Path, directory: &Path, request: &Path) -> anyhow::Result<()> {
+    let config: ProbeConfig = serde_json::from_slice(&std::fs::read(config)?)?;
+    let session = account::read_session(Path::new(&config.session))?;
+    let identity: account::DeviceIdentity =
+        serde_json::from_slice(&std::fs::read(&config.identity)?)?;
+    let secret = SecretKey::from_slice(&std::fs::read(directory.join("ephemeral-key.bin"))?)?;
+    let notify = std::fs::read(directory.join("reply-3.bin"))?;
+    let info = std::fs::read(directory.join("reply-1.bin"))?;
+    let (_, peer) = client_finished(
+        &config,
+        &session,
+        &identity,
+        &secret,
+        notify
+            .get(4..)
+            .ok_or_else(|| anyhow::anyhow!("Truncated notify"))?,
+        nested(
+            info.get(4..)
+                .ok_or_else(|| anyhow::anyhow!("Truncated device info"))?,
+            &[2, 2, 4, 2],
+        )?,
+    )?;
+    let finished = std::fs::read(directory.join("reply-4.bin"))?;
+    let key = verify_finished(
+        &secret,
+        &std::fs::read(directory.join("client-random.bin"))?,
+        &notify[4..],
+        finished
+            .get(4..)
+            .ok_or_else(|| anyhow::anyhow!("Truncated Finished"))?,
+    )?;
+    let request = std::fs::read(request)?;
+    let logical = nested(
+        request
+            .get(4..)
+            .ok_or_else(|| anyhow::anyhow!("Truncated request"))?,
+        &[2, 1],
+    )?;
+    anyhow::ensure!(
+        crate::file_channel::incoming(logical, &key, &peer)?.is_some(),
+        "Not a supported file-channel request"
+    );
+    println!(
+        "Saved file request verified: same-account certificate, session Finished, AES-GCM and peer signature. No private values printed."
     );
     Ok(())
 }
@@ -587,6 +655,16 @@ fn exchange(
     let mut server_notify = None;
     let mut authenticated = false;
     let mut active_key = None;
+    let mut peer_key = None;
+    // File-channel support remains confined to the private interoperability probe.
+    let probe_files = directory.is_some()
+        && config.services.as_ref().is_some_and(|services| {
+            services.iter().any(|s| {
+                s.name == crate::networking::FILE_TRANSFER
+                    && s.package == crate::networking::MAC_PACKAGE
+            })
+        });
+    let mut file_connection: Option<(u8, u32)> = None;
     anyhow::ensure!(
         !config.clipboard_sync || cfg!(feature = "clipboard"),
         "Clipboard feature required"
@@ -660,7 +738,7 @@ fn exchange(
             info = Some(device.to_vec());
         }
         if !finished_sent && nested(&reply[4..], &[2, 1, 5, 7, 2, 6, 3]).is_ok() {
-            let finished = client_finished(
+            let (finished, verified_peer) = client_finished(
                 &config,
                 &session,
                 &identity,
@@ -669,6 +747,7 @@ fn exchange(
                 info.as_deref()
                     .ok_or_else(|| anyhow::anyhow!("Missing peer device info"))?,
             )?;
+            peer_key = Some(verified_peer);
             save("client-finished.bin", &finished)?;
             transport.send(&finished)?;
             finished_sent = true;
@@ -706,6 +785,35 @@ fn exchange(
         if let (Some(session_key), Ok(logical)) =
             (active_key.as_ref(), nested(&reply[4..], &[2, 1]))
         {
+            if probe_files {
+                if let Some(peer) = peer_key.as_ref() {
+                    if let Some(incoming) =
+                        crate::file_channel::incoming(logical, session_key, peer)?
+                    {
+                        use base64::engine::general_purpose::STANDARD;
+                        let signing = p256::ecdsa::SigningKey::from_slice(
+                            &STANDARD.decode(&identity.private_key)?,
+                        )?;
+                        let inner = crate::file_channel::sync_reply(
+                            session_key,
+                            &signing,
+                            &session.user_id,
+                        )?;
+                        // Sync-info itself stays unencrypted; its credential is AES-GCM protected.
+                        let mut response = integer(1, 2);
+                        response.extend(integer(2, incoming.peer_id.into()));
+                        response.extend(integer(3, incoming.nonce.into()));
+                        response.extend(message(5, &inner));
+                        let response = frame(17, &message(2, &message(1, &response)))?;
+                        save("file-connection-response.bin", &response)?;
+                        transport.send(&response)?;
+                        file_connection = Some((incoming.peer_id, incoming.nonce));
+                        diagnostic!(
+                            "File-channel peer proof verified; reciprocal session credential sent."
+                        );
+                    }
+                }
+            }
             if number(logical, 4).unwrap_or(0) == 1 {
                 let encrypted = nested(logical, &[5])?;
                 anyhow::ensure!(encrypted.len() >= 28, "Truncated encrypted logical frame");
@@ -719,6 +827,31 @@ fn exchange(
                     plaintext.len(),
                     number(&plaintext, 1)?
                 );
+                if probe_files && number(logical, 2).unwrap_or(0) == 2 {
+                    anyhow::ensure!(
+                        file_connection
+                            == Some((
+                                u8::try_from(number(logical, 1)?)?,
+                                u32::try_from(number(logical, 3)?)?
+                            )),
+                        "Unexpected file-channel connection identity"
+                    );
+                    if number(&plaintext, 1)? == 1 {
+                        let request = nested(&plaintext, &[2])?;
+                        anyhow::ensure!(
+                            nested(request, &[2])?
+                                == b"com.xiaomi.hyperConnect:miLyraShareTransfer",
+                            "Unexpected file-channel service"
+                        );
+                        let mut response = integer(1, 2);
+                        response.extend(message(3, &integer(3, 1)));
+                        transport.send(&logical_encrypted(&reply[4..], session_key, &response)?)?;
+                        diagnostic!(
+                            "File-channel authenticated request received; connection accepted for control-message capture."
+                        );
+                    }
+                    continue;
+                }
                 if number(&plaintext, 1)? == 2 {
                     let response = nested(&plaintext, &[3])?;
                     anyhow::ensure!(
@@ -750,6 +883,28 @@ fn exchange(
         }
         if reply[0] == 0x29 && reply.len() >= 34 {
             if let Some(key) = active_key.as_ref() {
+                if probe_files && file_connection.is_some() && reply[4] == 2 && reply[5] == 1 {
+                    let plaintext = Aes256Gcm::new_from_slice(key)
+                        .unwrap()
+                        .decrypt(Nonce::from_slice(&reply[6..18]), &reply[18..])
+                        .map_err(|_| {
+                            anyhow::anyhow!("File-channel payload authentication failed")
+                        })?;
+                    save(&format!("file-payload-{count}.bin"), &plaintext)?;
+                    match crate::file_channel::control(&plaintext) {
+                        Ok(control) => diagnostic!(
+                            "Authenticated file control: type {}; message {}; {} body bytes.",
+                            control.kind,
+                            control.message_id,
+                            control.body.len()
+                        ),
+                        Err(_) => diagnostic!(
+                            "Authenticated file payload has an unsupported control header: {} bytes.",
+                            plaintext.len()
+                        ),
+                    }
+                    continue;
+                }
                 anyhow::ensure!(
                     reply[4] == 1 && reply[5] == 1,
                     "Unexpected networking destination or encryption mode"
@@ -759,6 +914,12 @@ fn exchange(
                     .decrypt(Nonce::from_slice(&reply[6..18]), &reply[18..])
                     .map_err(|_| anyhow::anyhow!("Networking response authentication failed"))?;
                 save(&format!("payload-{count}.bin"), &plaintext)?;
+                if let Some(peer) = crate::networking::peer(&plaintext) {
+                    diagnostic!(
+                        "Authenticated peer capabilities received; native file sharing: {}. Device identifiers remain private.",
+                        peer.can_share_files()
+                    );
+                }
                 #[cfg(feature = "clipboard")]
                 if config.clipboard_sync {
                     if let Some(text) = crate::message_center::payload_text(&plaintext) {
