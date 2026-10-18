@@ -16,6 +16,13 @@ pub struct Service {
     pub data: Vec<u8>,
 }
 impl Service {
+    pub(crate) fn local_services() -> Vec<Self> {
+        #[allow(unused_mut)]
+        let mut services = vec![Self::clipboard()];
+        #[cfg(feature = "file-sharing")]
+        services.extend([Self::file_discovery(), Self::file_transfer()]);
+        services
+    }
     pub fn clipboard() -> Self {
         Self {
             name: "universalClipboard".into(),
@@ -145,6 +152,19 @@ pub fn peer(payload: &[u8]) -> Option<Peer> {
 mod tests {
     use super::*;
     use crate::wire::integer;
+    #[cfg(feature = "file-sharing")]
+    #[test]
+    fn default_services_make_file_receiver_discoverable() {
+        let services = Service::local_services();
+        assert!(services.iter().any(|s| s.name == "universalClipboard"));
+        for name in [FILE_DISCOVERY, FILE_TRANSFER] {
+            assert!(
+                services
+                    .iter()
+                    .any(|s| s.name == name && s.package == MAC_PACKAGE)
+            );
+        }
+    }
     fn fixture(command: u64, services: &[Service]) -> Vec<u8> {
         let mut device = message(1, b"Test phone");
         device.extend(integer(2, 1));

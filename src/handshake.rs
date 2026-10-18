@@ -115,7 +115,7 @@ fn networking_probe(
     device.extend(integer(21, 128));
     device.extend(message(23, device_id.as_bytes()));
     device.extend(integer(10, 5));
-    let default_services = vec![crate::networking::Service::clipboard()];
+    let default_services = crate::networking::Service::local_services();
     let services = config.services.as_ref().unwrap_or(&default_services);
     anyhow::ensure!(services.len() <= 8, "Too many advertised services");
     for service in services {
@@ -362,6 +362,8 @@ struct ProbeConfig {
     clipboard_sync: bool,
     #[serde(default)]
     services: Option<Vec<crate::networking::Service>>,
+    #[serde(default)]
+    receive_directory: Option<String>,
 }
 fn default_endpoint() -> SocketAddr {
     ([0, 0, 0, 0], 0).into()
@@ -549,11 +551,23 @@ pub enum SyncEvent {
     Received(usize),
     Sent(usize),
     Unsupported,
+    FileClipboardSkipped,
+    UnsupportedClipboard,
     File(crate::file_feedback::Event),
 }
 
 pub fn probe(config: &Path, directory: &Path) -> anyhow::Result<()> {
-    exchange(config, Some(directory), None, &|_| {})
+    exchange(config, Some(directory), None, &|event| {
+        #[cfg(feature = "research")]
+        if matches!(
+            event,
+            SyncEvent::File(crate::file_feedback::Event::Saved { .. })
+        ) {
+            crate::notifications::deliver(true);
+        }
+        #[cfg(not(feature = "research"))]
+        let _ = event;
+    })
 }
 
 #[cfg(feature = "clipboard")]
@@ -585,7 +599,21 @@ fn exchange(
     }
     if stop.is_some() {
         config.clipboard_sync = true;
+        #[cfg(feature = "file-sharing")]
+        if config.receive_directory.is_none() {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| anyhow::anyhow!("Home directory unavailable"))?;
+            config.receive_directory = Some(
+                std::path::PathBuf::from(home)
+                    .join("Downloads")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
     }
+    config
+        .services
+        .get_or_insert_with(crate::networking::Service::local_services);
     if stop.is_some() {
         use std::net::ToSocketAddrs;
         if let Ok(endpoints) = crate::discovery::discover(Duration::from_secs(3)) {
@@ -639,6 +667,8 @@ fn exchange(
     };
     let socket = UdpSocket::bind(bind)?;
     socket.connect(config.endpoint)?;
+    #[cfg(feature = "file-sharing")]
+    let local_ip = socket.local_addr()?.ip();
     let mut transport = Transport::new(socket)?;
     save("client-random.bin", &random)?;
     save("ephemeral-key.bin", &key.to_bytes())?;
@@ -649,7 +679,7 @@ fn exchange(
         + Duration::from_secs(if stop.is_some() {
             86400
         } else {
-            config.listen_seconds.unwrap_or(15).clamp(1, 900)
+            config.listen_seconds.unwrap_or(15).clamp(1, 86400)
         });
     let mut last_received = started;
     let mut count = 0;
@@ -659,16 +689,19 @@ fn exchange(
     let mut authenticated = false;
     let mut active_key = None;
     let mut peer_key = None;
-    // File-channel support remains confined to the private interoperability probe.
+    // File services require the receiver feature and an explicit advertisement.
     let file_advertised = config.services.as_ref().is_some_and(|services| {
         services.iter().any(|s| {
             s.name == crate::networking::FILE_TRANSFER
                 && s.package == crate::networking::MAC_PACKAGE
         })
     });
-    let probe_files = directory.is_some() && file_advertised;
+    let files_enabled = cfg!(feature = "file-sharing") && file_advertised;
     let mut file_notice = None;
     let mut file_connection: Option<(u8, u32)> = None;
+    let mut file_port_binding: Option<crate::file_channel::PortBinding> = None;
+    #[cfg(feature = "file-sharing")]
+    let mut port_probe: Option<crate::file_channel::FileReceiver> = None;
     anyhow::ensure!(
         !config.clipboard_sync || cfg!(feature = "clipboard"),
         "Clipboard feature required"
@@ -686,6 +719,34 @@ fn exchange(
     #[cfg(feature = "clipboard")]
     let mut network_ready = false;
     while Instant::now() < deadline {
+        #[cfg(feature = "file-sharing")]
+        if let Some(probe) = port_probe.as_mut() {
+            let result = probe.poll();
+            if let Some((received, total)) = probe.take_progress() {
+                last_received = Instant::now();
+                on_event(SyncEvent::File(crate::file_feedback::Event::Progress {
+                    received,
+                    total,
+                }));
+            }
+            let saved = probe.take_saved();
+            if let Some(files) = saved {
+                on_event(SyncEvent::File(crate::file_feedback::Event::Saved {
+                    files,
+                }));
+            }
+            if let Err(error) = result {
+                diagnostic!("File transport closed: {error:#}. Authentication remains active.");
+                port_probe = None;
+                file_port_binding = None;
+                file_notice = None;
+                if saved.is_none() {
+                    on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
+                        crate::file_feedback::Failure::Disconnected,
+                    )));
+                }
+            }
+        }
         if stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
             break;
         }
@@ -693,15 +754,26 @@ fn exchange(
             authenticated || started.elapsed() < Duration::from_secs(20),
             "Phone authentication timed out"
         );
+        // Manual file probes must remain available between phone interactions.
+        // Their overall configured deadline still bounds the session.
         anyhow::ensure!(
-            last_received.elapsed() < Duration::from_secs(120),
+            (directory.is_some() && authenticated)
+                || last_received.elapsed() < Duration::from_secs(120),
             "Phone connection timed out"
         );
         #[cfg(feature = "clipboard")]
         if config.clipboard_sync && network_ready && active_key.is_some() {
             if crate::clipboard::change_count() != clipboard_count {
-                let (count, text) = crate::clipboard::read();
+                let (count, content) = crate::clipboard::read_content();
                 clipboard_count = count;
+                let text = match content {
+                    crate::clipboard::Content::Text(text) => Some(text),
+                    crate::clipboard::Content::Files => {
+                        on_event(SyncEvent::FileClipboardSkipped);
+                        None
+                    }
+                    crate::clipboard::Content::Unsupported => None,
+                };
                 if let Some(text) = text.filter(|t| Some(t) != last_text.as_ref()) {
                     sequence = sequence.wrapping_add(1);
                     if let Some(payload) = crate::message_center::text_payload(&text, sequence) {
@@ -722,11 +794,14 @@ fn exchange(
                 }
             }
         }
-        let slice = if config.clipboard_sync {
-            deadline.min(Instant::now() + Duration::from_millis(250))
+        let tick = Duration::from_millis(250);
+        #[cfg(feature = "file-sharing")]
+        let tick = if port_probe.as_ref().is_some_and(|probe| probe.running()) {
+            Duration::from_millis(20)
         } else {
-            deadline
+            tick
         };
+        let slice = deadline.min(Instant::now() + tick);
         let Some(reply) = transport.receive(slice)? else {
             continue;
         };
@@ -795,21 +870,26 @@ fn exchange(
                     // produce a trusted file notification in the resident app.
                     let incoming = match crate::file_channel::incoming(logical, session_key, peer) {
                         Ok(incoming) => incoming,
-                        Err(error) if probe_files => return Err(error),
+                        Err(error) if directory.is_some() => return Err(error),
                         Err(_) => None,
                     };
                     if let Some(incoming) = incoming {
                         let request = (incoming.peer_id, incoming.nonce);
                         if file_notice != Some(request) {
+                            file_port_binding = None;
+                            #[cfg(feature = "file-sharing")]
+                            {
+                                port_probe = None;
+                            }
                             file_notice = Some(request);
                             on_event(SyncEvent::File(crate::file_feedback::Event::Requested));
-                            if !probe_files {
+                            if !files_enabled {
                                 on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
                                     crate::file_feedback::Failure::Unavailable,
                                 )));
                             }
                         }
-                        if !probe_files {
+                        if !files_enabled {
                             continue;
                         }
                         use base64::engine::general_purpose::STANDARD;
@@ -836,6 +916,38 @@ fn exchange(
                     }
                 }
             }
+            if files_enabled && number(logical, 4).unwrap_or(0) != 1 {
+                if let Ok(body) = nested(logical, &[5])
+                    && number(body, 1).unwrap_or(0) == 4
+                    && file_connection
+                        == Some((
+                            u8::try_from(number(logical, 1)?)?,
+                            u32::try_from(number(logical, 3)?)?,
+                        ))
+                    && number(logical, 2).unwrap_or(0) == 2
+                {
+                    let code = nested(body, &[5])
+                        .ok()
+                        .and_then(|b| number(b, 1).ok())
+                        .unwrap_or(0);
+                    diagnostic!(
+                        "Peer closed file logical connection: code {code}; ready for a new request."
+                    );
+                    file_connection = None;
+                    file_port_binding = None;
+                    file_notice = None;
+                    #[cfg(feature = "file-sharing")]
+                    {
+                        if !port_probe.as_ref().is_some_and(|probe| probe.completed()) {
+                            on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
+                                crate::file_feedback::Failure::Disconnected,
+                            )));
+                        }
+                        port_probe = None;
+                    }
+                    continue;
+                }
+            }
             if number(logical, 4).unwrap_or(0) == 1 {
                 let encrypted = nested(logical, &[5])?;
                 anyhow::ensure!(encrypted.len() >= 28, "Truncated encrypted logical frame");
@@ -849,7 +961,7 @@ fn exchange(
                     plaintext.len(),
                     number(&plaintext, 1)?
                 );
-                if probe_files && number(logical, 2).unwrap_or(0) == 2 {
+                if files_enabled && number(logical, 2).unwrap_or(0) == 2 {
                     anyhow::ensure!(
                         file_connection
                             == Some((
@@ -865,6 +977,9 @@ fn exchange(
                                 == b"com.xiaomi.hyperConnect:miLyraShareTransfer",
                             "Unexpected file-channel service"
                         );
+                        file_port_binding = Some(crate::file_channel::PortBinding::from_user_info(
+                            nested(request, &[3])?,
+                        )?);
                         let mut response = integer(1, 2);
                         response.extend(message(3, &integer(3, 1)));
                         transport.send(&logical_encrypted(&reply[4..], session_key, &response)?)?;
@@ -905,21 +1020,63 @@ fn exchange(
         }
         if reply[0] == 0x29 && reply.len() >= 34 {
             if let Some(key) = active_key.as_ref() {
-                if probe_files && file_connection.is_some() && reply[4] == 2 && reply[5] == 1 {
-                    let plaintext = Aes256Gcm::new_from_slice(key)
-                        .unwrap()
-                        .decrypt(Nonce::from_slice(&reply[6..18]), &reply[18..])
-                        .map_err(|_| {
-                            anyhow::anyhow!("File-channel payload authentication failed")
-                        })?;
+                if files_enabled && reply[4] == 2 && file_connection.is_none() {
+                    diagnostic!("Late file payload ignored after logical channel closure.");
+                    continue;
+                }
+                if files_enabled
+                    && file_connection.is_some()
+                    && reply[4] == 2
+                    && matches!(reply[5], 0 | 1)
+                {
+                    let plaintext = if reply[5] == 1 {
+                        Aes256Gcm::new_from_slice(key)
+                            .unwrap()
+                            .decrypt(Nonce::from_slice(&reply[6..18]), &reply[18..])
+                            .map_err(|_| {
+                                anyhow::anyhow!("File-channel payload authentication failed")
+                            })?
+                    } else {
+                        reply[6..].to_vec()
+                    };
                     save(&format!("file-payload-{count}.bin"), &plaintext)?;
                     match crate::file_channel::control(&plaintext) {
-                        Ok(control) => diagnostic!(
-                            "Authenticated file control: type {}; message {}; {} body bytes.",
-                            control.kind,
-                            control.message_id,
-                            control.body.len()
-                        ),
+                        Ok(control) => {
+                            diagnostic!(
+                                "Authenticated file control: type {}; message {}; {} body bytes.",
+                                control.kind,
+                                control.message_id,
+                                control.body.len()
+                            );
+                            #[cfg(feature = "file-sharing")]
+                            if control.kind == 2 {
+                                let request = crate::file_channel::port_request(&control)?;
+                                file_port_binding
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Bulk control arrived before authenticated file request"
+                                        )
+                                    })?
+                                    .verify(&request)?;
+                                let probe = crate::file_channel::FileReceiver::open(
+                                    local_ip,
+                                    config.endpoint.ip(),
+                                    directory,
+                                    request.transfer_key,
+                                    config.receive_directory.as_deref().map(Path::new),
+                                )?;
+                                let response =
+                                    crate::file_channel::port_response(&request, 1, probe.port()?)?;
+                                let mut payload = vec![file_connection.unwrap().0, 0];
+                                payload.extend(response);
+                                transport.send(&frame(0x29, &payload)?)?;
+                                port_probe = Some(probe);
+                                diagnostic!(
+                                    "Bulk port response sent; identifiers and keys remain private."
+                                );
+                            }
+                        }
                         Err(_) => diagnostic!(
                             "Authenticated file payload has an unsupported control header: {} bytes.",
                             plaintext.len()
@@ -944,16 +1101,22 @@ fn exchange(
                 }
                 #[cfg(feature = "clipboard")]
                 if config.clipboard_sync {
-                    if let Some(text) = crate::message_center::payload_text(&plaintext) {
-                        if last_text.as_deref() != Some(text) {
-                            clipboard_count = crate::clipboard::write(text)?;
-                            last_text = Some(text.to_owned());
-                            on_event(SyncEvent::Received(text.len()));
-                            diagnostic!(
-                                "Phone → Mac: text written to native clipboard, {} bytes.",
-                                text.len()
-                            );
+                    match crate::message_center::clipboard_event(&plaintext) {
+                        Some(crate::message_center::ClipboardEvent::Text(text)) => {
+                            if last_text.as_deref() != Some(text) {
+                                clipboard_count = crate::clipboard::write(text)?;
+                                last_text = Some(text.to_owned());
+                                on_event(SyncEvent::Received(text.len()));
+                                diagnostic!(
+                                    "Phone → Mac: text written to native clipboard, {} bytes.",
+                                    text.len()
+                                );
+                            }
                         }
+                        Some(crate::message_center::ClipboardEvent::Unsupported) => {
+                            on_event(SyncEvent::UnsupportedClipboard)
+                        }
+                        None => (),
                     }
                 }
                 if plaintext.first() == Some(&1) {

@@ -114,6 +114,14 @@ fn schedule_frame(cx: &mut App, events: Sender<TrayEvent>, reduced_motion: bool)
     .detach();
 }
 
+fn visible_detail(feedback: &Feedback, status_detail: &str) -> String {
+    if status_detail.is_empty() {
+        feedback.detail().unwrap_or_default()
+    } else {
+        status_detail.to_owned()
+    }
+}
+
 fn render_feedback(
     feedback: &Feedback,
     icons: &mut FileIcons,
@@ -121,6 +129,7 @@ fn render_feedback(
     idle: &NSImage,
     now: Duration,
     reduced_motion: bool,
+    status_detail: &str,
 ) -> anyhow::Result<()> {
     let (icon, mut frame, mut animated) = feedback.appearance(now);
     if reduced_motion {
@@ -138,7 +147,8 @@ fn render_feedback(
         1.
     };
     button.setAlphaValue(alpha);
-    if let Some(detail) = feedback.detail() {
+    let detail = visible_detail(feedback, status_detail);
+    if !detail.is_empty() {
         button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
             "Mi Clip · {detail}"
         ))));
@@ -264,6 +274,26 @@ pub fn install(
                         }
                         Ok(())
                     })?;
+                    if matches!(event, FileEvent::Failed(_)) {
+                        test_events
+                            .send(TrayEvent::Status(
+                                "已连接",
+                                "此内容暂不支持 · 当前仅同步短文本".into(),
+                            ))
+                            .await?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(250))
+                            .await;
+                        cx.update(|_| -> anyhow::Result<()> {
+                            anyhow::ensure!(
+                                test_button
+                                    .toolTip()
+                                    .is_some_and(|text| text.to_string().contains("仅同步短文本")),
+                                "Old file feedback hid clipboard format hint"
+                            );
+                            Ok(())
+                        })?;
+                    }
                 }
                 cx.update(|cx| -> anyhow::Result<()> {
                     anyhow::ensure!(cx.windows().is_empty(), "Unexpected startup window");
@@ -470,7 +500,7 @@ pub fn install(
                         }
                         status_text = status;
                         detail_text = detail;
-                        let detail = feedback.detail().unwrap_or_else(|| detail_text.clone());
+                        let detail = visible_detail(&feedback, &detail_text);
                         button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
                             "Mi Clip · {status}{}",
                             if detail.is_empty() {
@@ -488,6 +518,9 @@ pub fn install(
                     }
                     TrayEvent::File(event) => {
                         let changed = feedback.apply(event, clock.elapsed());
+                        if changed {
+                            detail_text.clear();
+                        }
                         if changed && std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
                             if let Some(detail) = feedback.detail() {
                                 println!("Mi Clip file state: {detail}");
@@ -514,6 +547,7 @@ pub fn install(
                             &image,
                             clock.elapsed(),
                             reduced_motion,
+                            &detail_text,
                         )?;
                         if feedback.appearance(clock.elapsed()).2
                             && (!reduced_motion || feedback.active())
@@ -550,6 +584,7 @@ pub fn install(
                             &image,
                             clock.elapsed(),
                             reduced_motion,
+                            &detail_text,
                         )?;
                         if feedback.appearance(clock.elapsed()).2
                             && (!reduced_motion || feedback.active())
@@ -568,7 +603,7 @@ pub fn install(
                         return Ok(());
                     }
                 }
-                let detail = feedback.detail().unwrap_or_else(|| detail_text.clone());
+                let detail = visible_detail(&feedback, &detail_text);
                 // Rhai compilation and native popup allocation happen only on demand.
                 let prepared = ui::prepare_status(status_text, &detail)?;
                 let opened = cx.open_window(
@@ -609,6 +644,7 @@ pub fn install(
                     &image,
                     clock.elapsed(),
                     reduced_motion,
+                    &detail_text,
                 )?;
                 Ok(())
             });

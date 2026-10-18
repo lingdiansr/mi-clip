@@ -88,7 +88,12 @@ pub fn topic_name(id: u8) -> &'static str {
     }
 }
 
-pub fn payload_text(payload: &[u8]) -> Option<&str> {
+pub enum ClipboardEvent<'a> {
+    Text(&'a str),
+    Unsupported,
+}
+
+pub fn clipboard_event(payload: &[u8]) -> Option<ClipboardEvent<'_>> {
     use crate::wire;
     if payload.first() != Some(&1) {
         return None;
@@ -100,11 +105,18 @@ pub fn payload_text(payload: &[u8]) -> Option<&str> {
     let message = wire::bytes_field(networking, 8)?;
     let packet = wire::bytes_field(message, 1)?;
     let topics = decode(packet)?;
-    topics
-        .into_iter()
-        .rev()
-        .find(|t| t.id == CLIPBOARD_TOPIC)?
-        .short_text()
+    let topic = topics.into_iter().rev().find(|t| t.id == CLIPBOARD_TOPIC)?;
+    Some(match topic.short_text() {
+        Some(text) => ClipboardEvent::Text(text),
+        None => ClipboardEvent::Unsupported,
+    })
+}
+
+pub fn payload_text(payload: &[u8]) -> Option<&str> {
+    match clipboard_event(payload)? {
+        ClipboardEvent::Text(text) => Some(text),
+        ClipboardEvent::Unsupported => None,
+    }
 }
 
 /// Encode one inline UTF-8 text item, including its networking module envelope.
@@ -186,6 +198,26 @@ mod tests {
         assert!(decode(&[0, 2, 0, 0x80, 0x80]).is_none());
         assert!(decode(&[0, 255, 0, 0]).is_none());
         assert!(decode(&vec![0; MAX_PACKET + 1]).is_none());
+    }
+
+    #[test]
+    fn unsupported_clipboard_content_is_distinct_from_malformed_or_unrelated_packets() {
+        use crate::wire::{integer, message};
+        for (id, flags, mime, expected) in
+            [(2, 0, 237, true), (2, 1, 236, true), (3, 0, 237, false)]
+        {
+            let packet = [0, id, 0x20, flags, mime, 1, 42];
+            let mut payload = vec![1];
+            payload.extend(integer(1, 4));
+            payload.extend(message(8, &message(1, &packet)));
+            assert_eq!(
+                matches!(clipboard_event(&payload), Some(ClipboardEvent::Unsupported)),
+                expected
+            );
+            assert!(payload_text(&payload).is_none());
+            payload.pop();
+            assert!(clipboard_event(&payload).is_none());
+        }
     }
 
     #[test]

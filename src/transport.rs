@@ -153,10 +153,13 @@ impl Transport {
             if let Some(message) = self.ready.pop_front() {
                 return Ok(Some(message));
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok(None);
             }
             self.flush()?;
+            self.socket
+                .set_read_timeout(Some((deadline - now).min(Duration::from_millis(250))))?;
             match self.socket.recv(&mut buffer) {
                 Ok(n) => self.ingest(&buffer[..n])?,
                 Err(e)
@@ -178,6 +181,20 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idle_receive_respects_short_deadlines_for_other_channel_polling() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect(peer.local_addr().unwrap()).unwrap();
+        let mut transport = Transport::new(socket).unwrap();
+        assert!(
+            transport
+                .receive(Instant::now() + Duration::from_millis(30))
+                .unwrap()
+                .is_none()
+        );
+        assert!(transport.socket.read_timeout().unwrap().unwrap() <= Duration::from_millis(50));
+    }
     #[test]
     fn reorders_fragments_and_ignores_duplicates() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();

@@ -41,7 +41,10 @@ fn read_varint(input: &[u8], pos: &mut usize) -> Option<u64> {
     None
 }
 pub fn fields(input: &[u8]) -> Option<Vec<Field<'_>>> {
-    if input.len() > 131072 {
+    fields_with_limit(input, 131072)
+}
+pub(crate) fn fields_with_limit(input: &[u8], maximum: usize) -> Option<Vec<Field<'_>>> {
+    if input.len() > maximum {
         return None;
     }
     let mut out = Vec::new();

@@ -28,6 +28,12 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                     }
                     SyncEvent::Received(_) | SyncEvent::Sent(_) => ("已连接", String::new()),
                     SyncEvent::Unsupported => ("已连接", "已跳过超出长度限制的内容".into()),
+                    SyncEvent::FileClipboardSkipped => {
+                        ("已连接", "暂不支持文件剪贴板同步，已跳过".into())
+                    }
+                    SyncEvent::UnsupportedClipboard => {
+                        ("已连接", "此内容暂不支持 · 当前仅同步短文本".into())
+                    }
                 };
                 let _ = events.try_send(TrayEvent::Status(status.0, status.1));
             });
