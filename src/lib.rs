@@ -4,6 +4,8 @@ pub mod advertisement;
 pub mod auth_cli;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
+#[cfg(feature = "file-sharing")]
+mod clipboard_files;
 pub mod discovery;
 mod file_channel;
 pub mod file_feedback;

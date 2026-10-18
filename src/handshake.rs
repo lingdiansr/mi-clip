@@ -552,6 +552,10 @@ pub enum SyncEvent {
     Sent(usize),
     Unsupported,
     FileClipboardSkipped,
+    FileClipboardOffered(u32),
+    FileClipboardRequested,
+    FileClipboardSent(u32),
+    FileClipboardFailed,
     UnsupportedClipboard,
     File(crate::file_feedback::Event),
 }
@@ -699,9 +703,12 @@ fn exchange(
     let files_enabled = cfg!(feature = "file-sharing") && file_advertised;
     let mut file_notice = None;
     let mut file_connection: Option<(u8, u32)> = None;
+    let mut file_service: Option<&'static str> = None;
     let mut file_port_binding: Option<crate::file_channel::PortBinding> = None;
     #[cfg(feature = "file-sharing")]
     let mut port_probe: Option<crate::file_channel::FileReceiver> = None;
+    #[cfg(feature = "file-sharing")]
+    let mut clipboard_offer: Option<std::sync::Arc<crate::clipboard_files::Offer>> = None;
     anyhow::ensure!(
         !config.clipboard_sync || cfg!(feature = "clipboard"),
         "Clipboard feature required"
@@ -712,6 +719,13 @@ fn exchange(
     } else {
         0
     };
+    // A manual interoperability run may start after the user copied its test
+    // file. Inspect that current snapshot once; normal resident startup keeps
+    // its existing change-count behavior and never republishes old content.
+    #[cfg(all(feature = "research", feature = "clipboard"))]
+    if directory.is_some() && config.clipboard_sync {
+        clipboard_count = clipboard_count.wrapping_sub(1);
+    }
     #[cfg(feature = "clipboard")]
     let mut last_text: Option<String> = None;
     #[cfg(feature = "clipboard")]
@@ -722,6 +736,10 @@ fn exchange(
         #[cfg(feature = "file-sharing")]
         if let Some(probe) = port_probe.as_mut() {
             let result = probe.poll();
+            if let Some(files) = probe.take_sent() {
+                last_received = Instant::now();
+                on_event(SyncEvent::FileClipboardSent(files));
+            }
             if let Some((received, total)) = probe.take_progress() {
                 last_received = Instant::now();
                 on_event(SyncEvent::File(crate::file_feedback::Event::Progress {
@@ -740,7 +758,9 @@ fn exchange(
                 port_probe = None;
                 file_port_binding = None;
                 file_notice = None;
-                if saved.is_none() {
+                if file_service.is_some_and(crate::file_channel::clipboard_service) {
+                    on_event(SyncEvent::FileClipboardFailed);
+                } else if saved.is_none() {
                     on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
                         crate::file_feedback::Failure::Disconnected,
                     )));
@@ -766,16 +786,60 @@ fn exchange(
             if crate::clipboard::change_count() != clipboard_count {
                 let (count, content) = crate::clipboard::read_content();
                 clipboard_count = count;
+                #[cfg(feature = "file-sharing")]
+                {
+                    clipboard_offer = None;
+                    if file_service.is_some_and(crate::file_channel::clipboard_service) {
+                        port_probe = None;
+                        file_connection = None;
+                        file_port_binding = None;
+                        file_notice = None;
+                        file_service = None;
+                    }
+                }
                 let text = match content {
                     crate::clipboard::Content::Text(text) => Some(text),
-                    crate::clipboard::Content::Files => {
-                        on_event(SyncEvent::FileClipboardSkipped);
+                    crate::clipboard::Content::Files(paths) => {
+                        diagnostic!(
+                            "Concrete clipboard file URL snapshot: {} items.",
+                            paths.len()
+                        );
+                        #[cfg(feature = "file-sharing")]
+                        {
+                            sequence = (sequence % 127) + 1;
+                            match crate::clipboard_files::Offer::open(paths, sequence) {
+                                Ok(offer) => {
+                                    transport.send(&encrypted_payload(
+                                        active_key.as_ref().unwrap(),
+                                        &offer.announcement(),
+                                    )?)?;
+                                    on_event(SyncEvent::FileClipboardOffered(
+                                        offer.files.len() as u32
+                                    ));
+                                    diagnostic!(
+                                        "Lazy file clipboard announced; {} pinned regular files. No paths or contents printed.",
+                                        offer.files.len()
+                                    );
+                                    clipboard_offer = Some(std::sync::Arc::new(offer));
+                                    last_text = None;
+                                }
+                                Err(error) => {
+                                    diagnostic!("Clipboard file offer unavailable: {error:#}.");
+                                    on_event(SyncEvent::FileClipboardSkipped);
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "file-sharing"))]
+                        {
+                            let _ = paths;
+                            on_event(SyncEvent::FileClipboardSkipped);
+                        }
                         None
                     }
                     crate::clipboard::Content::Unsupported => None,
                 };
                 if let Some(text) = text.filter(|t| Some(t) != last_text.as_ref()) {
-                    sequence = sequence.wrapping_add(1);
+                    sequence = (sequence % 127) + 1;
                     if let Some(payload) = crate::message_center::text_payload(&text, sequence) {
                         transport
                             .send(&encrypted_payload(active_key.as_ref().unwrap(), &payload)?)?;
@@ -874,6 +938,14 @@ fn exchange(
                         Err(_) => None,
                     };
                     if let Some(incoming) = incoming {
+                        let is_clipboard = crate::file_channel::clipboard_service(incoming.service);
+                        #[cfg(feature = "file-sharing")]
+                        if is_clipboard && clipboard_offer.is_none() {
+                            continue;
+                        }
+                        if is_clipboard && !files_enabled {
+                            continue;
+                        }
                         let request = (incoming.peer_id, incoming.nonce);
                         if file_notice != Some(request) {
                             file_port_binding = None;
@@ -882,7 +954,12 @@ fn exchange(
                                 port_probe = None;
                             }
                             file_notice = Some(request);
-                            on_event(SyncEvent::File(crate::file_feedback::Event::Requested));
+                            file_service = Some(incoming.service);
+                            if is_clipboard {
+                                on_event(SyncEvent::FileClipboardRequested);
+                            } else {
+                                on_event(SyncEvent::File(crate::file_feedback::Event::Requested));
+                            }
                             if !files_enabled {
                                 on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
                                     crate::file_feedback::Failure::Unavailable,
@@ -896,10 +973,11 @@ fn exchange(
                         let signing = p256::ecdsa::SigningKey::from_slice(
                             &STANDARD.decode(&identity.private_key)?,
                         )?;
-                        let inner = crate::file_channel::sync_reply(
+                        let inner = crate::file_channel::sync_reply_for_service(
                             session_key,
                             &signing,
                             &session.user_id,
+                            incoming.service,
                         )?;
                         // Sync-info itself stays unencrypted; its credential is AES-GCM protected.
                         let mut response = integer(1, 2);
@@ -939,12 +1017,17 @@ fn exchange(
                     #[cfg(feature = "file-sharing")]
                     {
                         if !port_probe.as_ref().is_some_and(|probe| probe.completed()) {
-                            on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
-                                crate::file_feedback::Failure::Disconnected,
-                            )));
+                            if file_service.is_some_and(crate::file_channel::clipboard_service) {
+                                on_event(SyncEvent::FileClipboardFailed);
+                            } else {
+                                on_event(SyncEvent::File(crate::file_feedback::Event::Failed(
+                                    crate::file_feedback::Failure::Disconnected,
+                                )));
+                            }
                         }
                         port_probe = None;
                     }
+                    file_service = None;
                     continue;
                 }
             }
@@ -973,8 +1056,7 @@ fn exchange(
                     if number(&plaintext, 1)? == 1 {
                         let request = nested(&plaintext, &[2])?;
                         anyhow::ensure!(
-                            nested(request, &[2])?
-                                == b"com.xiaomi.hyperConnect:miLyraShareTransfer",
+                            Some(nested(request, &[2])?) == file_service.map(str::as_bytes),
                             "Unexpected file-channel service"
                         );
                         file_port_binding = Some(crate::file_channel::PortBinding::from_user_info(
@@ -1059,13 +1141,30 @@ fn exchange(
                                         )
                                     })?
                                     .verify(&request)?;
-                                let probe = crate::file_channel::FileReceiver::open(
+                                let mut probe = crate::file_channel::FileReceiver::open(
                                     local_ip,
                                     config.endpoint.ip(),
                                     directory,
                                     request.transfer_key,
-                                    config.receive_directory.as_deref().map(Path::new),
+                                    if file_service
+                                        .is_some_and(crate::file_channel::clipboard_service)
+                                    {
+                                        None
+                                    } else {
+                                        config.receive_directory.as_deref().map(Path::new)
+                                    },
                                 )?;
+                                if file_service.is_some_and(crate::file_channel::clipboard_service)
+                                {
+                                    probe.serve_clipboard(
+                                        clipboard_offer
+                                            .as_ref()
+                                            .ok_or_else(|| {
+                                                anyhow::anyhow!("Expired clipboard offer")
+                                            })?
+                                            .clone(),
+                                    );
+                                }
                                 let response =
                                     crate::file_channel::port_response(&request, 1, probe.port()?)?;
                                 let mut payload = vec![file_connection.unwrap().0, 0];
@@ -1104,6 +1203,19 @@ fn exchange(
                     match crate::message_center::clipboard_event(&plaintext) {
                         Some(crate::message_center::ClipboardEvent::Text(text)) => {
                             if last_text.as_deref() != Some(text) {
+                                #[cfg(feature = "file-sharing")]
+                                {
+                                    clipboard_offer = None;
+                                    if file_service
+                                        .is_some_and(crate::file_channel::clipboard_service)
+                                    {
+                                        port_probe = None;
+                                        file_connection = None;
+                                        file_port_binding = None;
+                                        file_notice = None;
+                                        file_service = None;
+                                    }
+                                }
                                 clipboard_count = crate::clipboard::write(text)?;
                                 last_text = Some(text.to_owned());
                                 on_event(SyncEvent::Received(text.len()));

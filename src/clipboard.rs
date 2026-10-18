@@ -1,11 +1,11 @@
-//! Native macOS text clipboard access; no helper processes or history database.
+//! Native macOS clipboard snapshots; no helper processes or history database.
 use objc2::rc::autoreleasepool;
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-use objc2_foundation::{NSArray, NSString, ns_string};
+use objc2_foundation::{NSArray, NSString, NSURL, ns_string};
 
 pub enum Content {
     Text(String),
-    Files,
+    Files(Vec<std::path::PathBuf>),
     Unsupported,
 }
 
@@ -21,8 +21,8 @@ fn read_from(board: &NSPasteboard) -> (isize, Content) {
         ns_string!("com.apple.pasteboard.promised-file-url"),
         ns_string!("com.apple.pasteboard.promised-file-content-type"),
     ]);
-    // This API checks all items, so a file after a text item still blocks text
-    // fallback. Do not resolve URLs, request promised data, or open any files.
+    // Check every item before considering text. Resolve only concrete local
+    // file URLs below; never materialize promised files or read file contents.
     let file_utis = NSArray::from_slice(&[
         unsafe { objc2_app_kit::NSPasteboardTypeFileURL },
         ns_string!("com.apple.pasteboard.promised-file-url"),
@@ -31,7 +31,33 @@ fn read_from(board: &NSPasteboard) -> (isize, Content) {
     let files = board.availableTypeFromArray(&file_types).is_some()
         || board.canReadItemWithDataConformingToTypes(&file_utis);
     let content = if files {
-        Content::Files
+        // Read concrete file URLs only; promised files remain unsupported and
+        // never fall back to the plain-text filename Finder also provides.
+        let mut paths = Vec::new();
+        if let Some(items) = board.pasteboardItems() {
+            for index in 0..items.count().min(129) {
+                let item = items.objectAtIndex(index);
+                if let Some(value) =
+                    item.stringForType(unsafe { objc2_app_kit::NSPasteboardTypeFileURL })
+                {
+                    if let Some(url) = NSURL::URLWithString(&value) {
+                        if url.isFileURL()
+                            && url
+                                .host()
+                                .is_none_or(|h| h.length() == 0 || h.to_string() == "localhost")
+                        {
+                            // Finder can provide file:///.file/id=... URLs.
+                            // Foundation resolves these inode references;
+                            // ordinary URL decoding produces an unusable path.
+                            if let Some(path) = url.filePathURL().and_then(|u| u.path()) {
+                                paths.push(std::path::PathBuf::from(path.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Content::Files(paths)
     } else {
         board
             .stringForType(unsafe { NSPasteboardTypeString })
@@ -79,6 +105,35 @@ mod tests {
         }
     }
     #[test]
+    fn finder_file_reference_is_resolved_after_file_rename() {
+        autoreleasepool(|_| {
+            let root = std::env::temp_dir().join(format!(
+                "clip-url-{:016x}",
+                u64::from_ne_bytes(crate::private::random().unwrap())
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let before = root.join("测试 original.bin");
+            let after = root.join("moved.bin");
+            std::fs::write(&before, b"synthetic file").unwrap();
+            let url = NSURL::fileURLWithPath(&NSString::from_str(before.to_str().unwrap()));
+            let reference = url.fileReferenceURL().unwrap().absoluteString().unwrap();
+            std::fs::rename(&before, &after).unwrap();
+            let board = TestBoard(NSPasteboard::pasteboardWithUniqueName());
+            assert!(board.0.setString_forType(&reference, unsafe {
+                objc2_app_kit::NSPasteboardTypeFileURL
+            }));
+            let Content::Files(paths) = read_from(&board.0).1 else {
+                panic!("File URL became text");
+            };
+            assert_eq!(paths.len(), 1);
+            assert_eq!(
+                paths[0].canonicalize().unwrap(),
+                after.canonicalize().unwrap()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        });
+    }
+    #[test]
     fn native_file_representations_override_filename_text_without_touching_user_clipboard() {
         autoreleasepool(|_| {
             let board = TestBoard(NSPasteboard::pasteboardWithUniqueName());
@@ -106,7 +161,7 @@ mod tests {
                 assert!(board.0.setString_forType(ns_string!("report.pdf"), unsafe {
                     NSPasteboardTypeString
                 }));
-                assert!(matches!(read_from(&board.0).1, Content::Files));
+                assert!(matches!(read_from(&board.0).1, Content::Files(_)));
             }
             // A file in a later item also blocks the first item's text fallback.
             {
@@ -121,7 +176,9 @@ mod tests {
                     ProtocolObject::from_ref(&*file);
                 board.0.clearContents();
                 assert!(board.0.writeObjects(&NSArray::from_slice(&[text, file])));
-                assert!(matches!(read_from(&board.0).1, Content::Files));
+                assert!(
+                    matches!(read_from(&board.0).1, Content::Files(paths) if paths == [std::path::PathBuf::from("/synthetic/report.pdf")])
+                );
             }
             // Actual text remains text, even when it resembles a filename or URL.
             for text in [

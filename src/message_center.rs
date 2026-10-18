@@ -146,9 +146,49 @@ pub fn text_payload(text: &str, sequence: u8) -> Option<Vec<u8>> {
     Some(payload)
 }
 
+/// A lazy file announcement. The extension is a display name, never a file
+/// path or inline content; the authenticated peer must request the file bytes.
+pub(crate) fn file_payload(name: &str, sequence: u8, mimes: &[u8]) -> Option<Vec<u8>> {
+    use crate::wire::{integer, message};
+    if name.is_empty() || name.len() > 240 || !(1..=128).contains(&mimes.len()) {
+        return None;
+    }
+    // Native BroadcastCodec emits up to seven file MIME codes.
+    let mut base = vec![((sequence & 127) << 1) | 1];
+    base.extend(mimes.iter().take(7));
+    let mut packet = vec![
+        0,
+        CLIPBOARD_TOPIC,
+        ((base.len() as u8) << 4) | (sequence & 15),
+    ];
+    packet.extend(base);
+    if name.len() < 128 {
+        packet.push(name.len() as u8);
+    } else {
+        packet.extend([(name.len() as u8 & 127) | 128, (name.len() >> 7) as u8]);
+    }
+    packet.extend(name.as_bytes());
+    let mut payload = vec![1];
+    payload.extend(integer(1, 4));
+    payload.extend(message(8, &message(1, &packet)));
+    Some(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_announcement_matches_native_lazy_encoding_and_never_becomes_text() {
+        let payload = file_payload("sample.bin", 7, &[0]).unwrap();
+        let body = crate::wire::bytes_field(&payload[1..], 8).unwrap();
+        let topic = decode(crate::wire::bytes_field(body, 1).unwrap())
+            .unwrap()
+            .remove(0);
+        // Cross-checked with the native encoder using a synthetic file only.
+        assert_eq!(topic.base, &[0x0f, 0]);
+        assert_eq!(topic.extension, b"sample.bin");
+        assert!(payload_text(&payload).is_none());
+    }
     #[test]
     fn text_envelope_handles_utf8_lengths_and_rejects_long_content() {
         for text in [

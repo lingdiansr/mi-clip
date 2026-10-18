@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     }
     if argument == Some("--help") {
         println!(
-            "Mi Clip — standalone Xiaomi clipboard client\nNo main window. Click the menu-bar icon for status.\n--config PATH: use a private account configuration\n--auth COMMAND INPUT OUTPUT: account setup and research CLI\n--check-ui: validate embedded Rhai scripts\n--smoke-test: exercise status button and popup lifecycle\n--probe HOST PORT: test device-info negotiation only\nSupports inline UTF-8 text up to 3 KiB and native phone file sharing to ~/Downloads. No vendor runtime required."
+            "Mi Clip — standalone Xiaomi clipboard client\nNo main window. Click the menu-bar icon for status.\n--config PATH: use a private account configuration\n--auth COMMAND INPUT OUTPUT: account setup and research CLI\n--check-ui: validate embedded Rhai scripts\n--smoke-test: exercise status button and popup lifecycle\n--probe HOST PORT: test device-info negotiation only\nSupports inline UTF-8 text up to 3 KiB, Mac file clipboard offers, and native phone file sharing to ~/Downloads. No vendor runtime required."
         );
         return Ok(());
     }

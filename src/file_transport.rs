@@ -294,6 +294,84 @@ pub(crate) fn stream_begin(id: u32) -> anyhow::Result<Vec<u8>> {
     union(1, 0x100, &tlv(5, 0, &express)?)
 }
 
+/// Clipboard uses the SDK directly, without the Express layer used by Share.
+pub(crate) fn sdk_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(bytes.len() <= 61440, "Oversized clipboard response");
+    union(1, 0x100, &tlv(5, 0, bytes)?)
+}
+pub(crate) fn sdk_stream(id: u32, size: u64, name: &str, mime: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        id > 0
+            && id <= i32::MAX as u32
+            && size <= crate::file_store::MAX_FILE_SIZE
+            && crate::file_store::valid_name(name),
+        "Invalid clipboard stream"
+    );
+    anyhow::ensure!(
+        mime.len() <= 128 && mime.bytes().all(|b| b.is_ascii_graphic()),
+        "Invalid file MIME"
+    );
+    let mut header = tlv(4, 0, &size.to_be_bytes())?;
+    header.extend(tlv(5, 1, mime.as_bytes())?);
+    header.extend(tlv(5, 2, name.as_bytes())?);
+    header.extend(tlv(5, 3, &[])?);
+    let mut payload = 0u16.to_be_bytes().to_vec();
+    payload.extend(tlv(0x100, 0, &header)?);
+    let mut fields = tlv(3, 0, &id.to_be_bytes())?;
+    fields.extend(tlv(3, 1, &1u32.to_be_bytes())?);
+    fields.extend(tlv(0x101, 2, &payload)?);
+    union(2, 0x100, &fields)
+}
+#[cfg(test)]
+pub(crate) fn sdk_event(id: u32, event: u32) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        id > 0 && (2..=5).contains(&event),
+        "Invalid clipboard stream event"
+    );
+    let mut fields = tlv(3, 0, &id.to_be_bytes())?;
+    fields.extend(tlv(3, 1, &event.to_be_bytes())?);
+    fields.extend(tlv(0x101, 2, &u16::MAX.to_be_bytes())?);
+    union(2, 0x100, &fields)
+}
+pub(crate) fn sdk_event_value(packet: &Node<'_>) -> anyhow::Result<(u32, u32)> {
+    anyhow::ensure!(
+        (packet.kind, packet.tag) == (0x100, 2),
+        "Unexpected clipboard frame"
+    );
+    let fields = nodes(packet.value)?;
+    anyhow::ensure!(
+        fields.len() == 3
+            && fields[0].kind == 3
+            && fields[0].tag == 0
+            && fields[1].kind == 3
+            && fields[1].tag == 1
+            && fields[2].kind == 0x101
+            && fields[2].tag == 2
+            && fields[2].value == [255, 255],
+        "Invalid clipboard stream event"
+    );
+    let id = u32::from_be_bytes(fields[0].value.try_into()?);
+    let event = u32::from_be_bytes(fields[1].value.try_into()?);
+    anyhow::ensure!(
+        id > 0 && (2..=5).contains(&event),
+        "Unknown clipboard stream event"
+    );
+    Ok((id, event))
+}
+pub(crate) fn sdk_data(id: u32, offset: i64, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        id > 0
+            && data.len() <= 16384
+            && ((offset >= 0 && !data.is_empty()) || (offset == -1 && data.is_empty())),
+        "Invalid clipboard data chunk"
+    );
+    let mut fields = tlv(3, 0, &id.to_be_bytes())?;
+    fields.extend(tlv(4, 1, &offset.to_be_bytes())?);
+    fields.extend(tlv(3, 2, &(data.len() as u32).to_be_bytes())?);
+    fields.extend(tlv(5, 3, data)?);
+    union(3, 0x100, &fields)
+}
+
 /// Express byte packets can exceed one SDK event record (native chunks are
 /// 60 KiB). Publish the control message only after its final authenticated chunk.
 #[derive(Default)]
@@ -348,6 +426,44 @@ impl BytesAssembler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipboard_sdk_frames_match_native_synthetic_encoder() {
+        // Independent native ChannelFrame serialization of synthetic values.
+        let decode = |hex: &str| -> Vec<u8> {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            super::sdk_stream(7, 12, "sample.heic", "image/heic").unwrap(),
+            decode(
+                "0101ffff000000710002010000020000006700030000000000040000000700030001000000040000000101010002000000470000010000000000003d0004000000000008000000000000000c000500010000000a696d6167652f68656963000500020000000b73616d706c652e686569630005000300000000"
+            )
+        );
+        let event = decode(
+            "0101ffff0000002c000201000002000000220003000000000004000000070003000100000004000000020101000200000002ffff",
+        );
+        assert_eq!(super::sdk_event(7, 2).unwrap(), event);
+        assert_eq!(
+            super::sdk_event_value(&super::frame(&event).unwrap()).unwrap(),
+            (7, 2)
+        );
+        assert_eq!(
+            super::sdk_data(7, 9, b"abc").unwrap(),
+            decode(
+                "0101ffff0000003d00030100000300000033000300000000000400000007000400010000000800000000000000090003000200000004000000030005000300000003616263"
+            )
+        );
+        assert!(super::sdk_data(7, 0, &[]).is_err());
+        assert!(super::sdk_data(7, -1, b"abc").is_err());
+        assert!(super::sdk_data(7, 0, &vec![0; 16385]).is_err());
+        let mut bad = event;
+        let last = bad.len() - 1;
+        bad[last] = 0;
+        assert!(super::sdk_event_value(&super::frame(&bad).unwrap()).is_err());
+    }
+
     use super::*;
     #[test]
     fn data_offer_requests_one_connection_matching_our_listener() {

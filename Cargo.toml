@@ -41,7 +41,7 @@ async-channel = { version = "2.5", optional = true }
 anyhow = "1"
 objc2 = { version = "0.6.4", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSObject", "NSString", "NSData", "NSGeometry"] }
-objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSPasteboard", "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSImage", "NSButton", "NSControl", "NSView", "NSResponder", "NSWindow", "NSScreen", "NSRunningApplication", "NSEvent", "NSWorkspace", "NSAccessibility", "block2"] }
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSImage", "NSButton", "NSControl", "NSView", "NSResponder", "NSWindow", "NSScreen", "NSRunningApplication", "NSEvent", "NSWorkspace", "NSAccessibility", "block2"] }
 x509-cert = { version = "0.2.5", features = ["pem"] }
 kcp = { version = "=0.6.0", optional = true }
 

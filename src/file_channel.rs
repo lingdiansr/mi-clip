@@ -21,13 +21,35 @@ fn number(input: &[u8], field: u32) -> Option<u64> {
 pub(crate) struct Incoming {
     pub peer_id: u8,
     pub nonce: u32,
+    pub service: &'static str,
 }
 
+pub(crate) const SHARE_SERVICE: &str = "com.xiaomi.hyperConnect:miLyraShareTransfer";
+pub(crate) fn clipboard_service(service: &str) -> bool {
+    matches!(
+        service,
+        "com.xiaomi.hyperConnect:universalClipboard" | "com.milink.service:universalClipboard"
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn sync_reply(
     key: &[u8; 32],
     signing: &SigningKey,
     uid: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    sync_reply_for_service(key, signing, uid, SHARE_SERVICE)
+}
+pub(crate) fn sync_reply_for_service(
+    key: &[u8; 32],
+    signing: &SigningKey,
+    uid: &str,
+    service: &str,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        service == SHARE_SERVICE || clipboard_service(service),
+        "Unsupported local service"
+    );
     use crate::wire::{integer, message};
     let challenge = crate::private::random::<32>()?;
     let signature: Signature = signing.sign(&challenge);
@@ -55,7 +77,7 @@ pub(crate) fn sync_reply(
     sync.extend(integer(2, 48));
     // The initial client connection uses local key-context index 1.
     sync.extend(integer(3, 1));
-    sync.extend(message(4, b"com.xiaomi.hyperConnect:miLyraShareTransfer"));
+    sync.extend(message(4, service.as_bytes()));
     sync.extend(message(5, &feature));
     sync.extend(message(6, &encrypted));
     let mut inner = integer(1, 5);
@@ -227,6 +249,19 @@ pub(crate) struct FileReceiver {
     completion: Option<Vec<u8>>,
     tcp_pending: Vec<u8>,
     tcp_total: u64,
+    clipboard: Option<std::sync::Arc<crate::clipboard_files::Offer>>,
+    sends: std::collections::VecDeque<ClipboardSend>,
+    sent: u32,
+    sent_pending: Option<u32>,
+}
+
+#[cfg(feature = "file-sharing")]
+struct ClipboardSend {
+    index: usize,
+    id: u32,
+    ready: bool,
+    offset: u64,
+    ending: bool,
 }
 #[cfg(feature = "file-sharing")]
 struct ProbeOutput(std::net::UdpSocket);
@@ -285,7 +320,56 @@ impl FileReceiver {
             completion: None,
             tcp_pending: Vec::new(),
             tcp_total: 0,
+            clipboard: None,
+            sends: std::collections::VecDeque::new(),
+            sent: 0,
+            sent_pending: None,
         })
+    }
+    pub fn serve_clipboard(&mut self, offer: std::sync::Arc<crate::clipboard_files::Offer>) {
+        self.clipboard = Some(offer);
+    }
+    pub fn take_sent(&mut self) -> Option<u32> {
+        self.sent_pending.take()
+    }
+    fn send_pending(&mut self) -> anyhow::Result<()> {
+        let (Some(offer), Some(reliable), Some(send)) = (
+            self.clipboard.as_ref(),
+            self.reliable.as_mut(),
+            self.sends.front_mut(),
+        ) else {
+            return Ok(());
+        };
+        if !send.ready || send.ending {
+            return Ok(());
+        }
+        // Bound each poll and the KCP queue so other clipboard events remain
+        // responsive. Read directly from the pinned selection in 16 KiB chunks.
+        for _ in 0..4 {
+            if reliable.wait_snd() >= 64 {
+                break;
+            }
+            let bytes = offer.read(send.index, send.offset)?;
+            let ending = bytes.is_empty();
+            let message = crate::file_transport::sdk_data(
+                send.id,
+                if ending {
+                    -1
+                } else {
+                    i64::try_from(send.offset)?
+                },
+                &bytes,
+            )?;
+            reliable.send(&crate::file_transport::seal(&self.transfer_key, &message)?)?;
+            send.offset += bytes.len() as u64;
+            send.ending = ending;
+            self.last_activity = std::time::Instant::now();
+            if ending {
+                break;
+            }
+        }
+        reliable.flush()?;
+        Ok(())
     }
     pub fn port(&self) -> anyhow::Result<u16> {
         Ok(self.listener.local_addr()?.port())
@@ -300,13 +384,17 @@ impl FileReceiver {
         self.progress_pending.take()
     }
     pub fn completed(&self) -> bool {
-        !self.saved.is_empty() && self.saved.iter().all(|saved| *saved)
+        if self.clipboard.is_some() {
+            self.sent > 0 && self.sends.is_empty()
+        } else {
+            !self.saved.is_empty() && self.saved.iter().all(|saved| *saved)
+        }
     }
     fn finish(&mut self) -> anyhow::Result<()> {
         self.done = true;
         self.stream.take();
         anyhow::ensure!(
-            self.receive_directory.is_none() || self.completed(),
+            (self.receive_directory.is_none() && self.sends.is_empty()) || self.completed(),
             "File connection ended before all files were saved"
         );
         Ok(())
@@ -458,6 +546,100 @@ impl FileReceiver {
                         "Bulk packet authentication passed; no file was committed."
                     );
                     if let Ok(packet) = crate::file_transport::frame(&plaintext) {
+                        if let Some(offer) = self.clipboard.as_ref() {
+                            match (packet.kind, packet.tag) {
+                                (0x100, 1) => {
+                                    let fields = crate::file_transport::nodes(packet.value)?;
+                                    anyhow::ensure!(
+                                        fields.len() == 1
+                                            && fields[0].kind == 5
+                                            && fields[0].tag == 0,
+                                        "Invalid clipboard byte frame"
+                                    );
+                                    let reply = offer.reply(fields[0].value)?;
+                                    reliable.send(&crate::file_transport::seal(
+                                        &self.transfer_key,
+                                        &crate::file_transport::sdk_bytes(&reply.message)?,
+                                    )?)?;
+                                    if let Some(index) = reply.file {
+                                        anyhow::ensure!(
+                                            self.sends.len() < 128,
+                                            "Too many clipboard file requests"
+                                        );
+                                        let id = (u32::from_ne_bytes(crate::private::random()?)
+                                            & 0x3fff_ffff)
+                                            + 1;
+                                        anyhow::ensure!(
+                                            self.sends.iter().all(|s| s.id != id),
+                                            "Duplicate stream identity"
+                                        );
+                                        let source = offer.check(index)?;
+                                        reliable.send(&crate::file_transport::seal(
+                                            &self.transfer_key,
+                                            &crate::file_transport::sdk_stream(
+                                                id,
+                                                source.size,
+                                                &source.name,
+                                                source.mime,
+                                            )?,
+                                        )?)?;
+                                        self.sends.push_back(ClipboardSend {
+                                            index,
+                                            id,
+                                            ready: false,
+                                            offset: 0,
+                                            ending: false,
+                                        });
+                                        file_trace!(
+                                            self.capture,
+                                            "Clipboard content response and SDK stream header sent."
+                                        );
+                                    } else {
+                                        file_trace!(
+                                            self.capture,
+                                            "Clipboard file metadata response sent."
+                                        );
+                                    }
+                                }
+                                (0x100, 2) => {
+                                    let (id, event) =
+                                        crate::file_transport::sdk_event_value(&packet)?;
+                                    let send =
+                                        self.sends.iter_mut().find(|s| s.id == id).ok_or_else(
+                                            || anyhow::anyhow!("Unknown clipboard stream identity"),
+                                        )?;
+                                    match event {
+                                        2 => {
+                                            send.ready = true;
+                                            file_trace!(
+                                                self.capture,
+                                                "Clipboard SDK stream accepted by phone."
+                                            );
+                                        }
+                                        3 => {
+                                            anyhow::ensure!(
+                                                send.ready
+                                                    && send.offset == offer.check(send.index)?.size,
+                                                "Premature clipboard completion"
+                                            );
+                                            self.sends.retain(|s| s.id != id);
+                                            self.sent += 1;
+                                            self.sent_pending = Some(self.sent);
+                                            file_trace!(
+                                                self.capture,
+                                                "Clipboard file completion confirmed by phone."
+                                            );
+                                        }
+                                        _ => {
+                                            anyhow::bail!("Phone cancelled clipboard file request")
+                                        }
+                                    }
+                                }
+                                _ => anyhow::bail!("Unsupported clipboard SDK frame"),
+                            }
+                            reliable.flush()?;
+                            return Ok(());
+                        }
                         if packet.kind == 0x100 && packet.tag == 1 {
                             let fields = crate::file_transport::nodes(packet.value)?;
                             if let Some(data) = fields
@@ -589,6 +771,11 @@ impl FileReceiver {
                     crate::file_transport::negotiation_reply(&message, 1)
                 {
                     reliable.send(&response)?;
+                    if self.clipboard.is_some() {
+                        reliable.flush()?;
+                        file_trace!(self.capture, "Clipboard SDK event framing negotiated.");
+                        return Ok(());
+                    }
                     let challenge = crate::private::random::<16>()?;
                     self.data_key = Some(challenge);
                     self.capture.save("bulk-challenge.bin", &challenge)?;
@@ -663,6 +850,7 @@ impl FileReceiver {
             }
         }
         self.receive_pending()?;
+        self.send_pending()?;
         Ok(())
     }
 }
@@ -717,9 +905,14 @@ pub(crate) fn incoming(
         return Ok(None);
     }
     let sync = bytes(inner, 6)?;
-    if bytes(sync, 4)? != b"com.xiaomi.hyperConnect:miLyraShareTransfer" {
-        return Ok(None);
-    }
+    let service = match bytes(sync, 4)? {
+        b"com.xiaomi.hyperConnect:miLyraShareTransfer" => SHARE_SERVICE,
+        b"com.xiaomi.hyperConnect:universalClipboard" => {
+            "com.xiaomi.hyperConnect:universalClipboard"
+        }
+        b"com.milink.service:universalClipboard" => "com.milink.service:universalClipboard",
+        _ => return Ok(None),
+    };
     anyhow::ensure!(logical.len() <= 4096, "Oversized file-channel request");
     anyhow::ensure!(
         number(logical, 2).unwrap_or(0) == 0,
@@ -752,12 +945,168 @@ pub(crate) fn incoming(
     anyhow::ensure!(challenge.len() == 32, "Invalid file-channel challenge");
     peer.verify(challenge, &Signature::from_der(bytes(proof, 2)?)?)
         .map_err(|_| anyhow::anyhow!("File-channel peer signature failed"))?;
-    Ok(Some(Incoming { peer_id, nonce }))
+    Ok(Some(Incoming {
+        peer_id,
+        nonce,
+        service,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "file-sharing")]
+    #[test]
+    fn clipboard_pull_uses_direct_sdk_frames_and_waits_for_phone_completion() {
+        for completion_at_size in [false, true] {
+            clipboard_pull(completion_at_size);
+        }
+    }
+    #[cfg(feature = "file-sharing")]
+    fn clipboard_pull(completion_at_size: bool) {
+        use crate::file_transport as ft;
+        use std::{
+            net::{IpAddr, Ipv4Addr, UdpSocket},
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+        let root = std::env::temp_dir().join(format!(
+            "clip-pull-{:016x}",
+            u64::from_ne_bytes(crate::private::random().unwrap())
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let content: Vec<_> = (0..700_000).map(|n| (n % 251) as u8).collect();
+        let path = root.join("synthetic.bin");
+        std::fs::write(&path, &content).unwrap();
+        let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let key = [0x42; 32];
+        let mut server = FileReceiver::open(local, local, None, key, None).unwrap();
+        server.serve_clipboard(Arc::new(
+            crate::clipboard_files::Offer::open(vec![path], 7).unwrap(),
+        ));
+        let socket = UdpSocket::bind((local, 0)).unwrap();
+        socket.connect((local, server.port().unwrap())).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut peer = kcp::Kcp::new(0x12345678, ProbeOutput(socket.try_clone().unwrap()));
+        peer.set_nodelay(true, 20, 2, true);
+        peer.set_wndsize(32, 128);
+        peer.set_mtu(1400).unwrap();
+        let mut info = ft::tlv(3, 0, &1u32.to_be_bytes()).unwrap();
+        info.extend(ft::tlv(3, 1, &1u32.to_be_bytes()).unwrap());
+        info.extend(ft::tlv(3, 2, &0xff00u32.to_be_bytes()).unwrap());
+        let mut branch = 0u16.to_be_bytes().to_vec();
+        branch.extend(ft::tlv(256, 0, &info).unwrap());
+        peer.send(&ft::tlv(257, u16::MAX, &branch).unwrap())
+            .unwrap();
+        peer.update(0).unwrap();
+        let started = Instant::now();
+        let mut packet = [0; 65536];
+        let mut stream_id = None;
+        let mut received: Vec<u8> = Vec::new();
+        let mut ended = false;
+        let mut metadata = false;
+        while started.elapsed() < Duration::from_secs(5) && server.sent == 0 {
+            server.poll().unwrap();
+            peer.update(started.elapsed().as_millis() as u32).unwrap();
+            loop {
+                match socket.recv(&mut packet) {
+                    Ok(n) => {
+                        peer.input(&packet[..n]).unwrap();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            while let Ok(size) = peer.peeksize() {
+                let mut message = vec![0; size];
+                peer.recv(&mut message).unwrap();
+                let Ok(plain) = ft::open(&key, &message) else {
+                    assert_eq!(ft::frame(&message).unwrap().tag, 4);
+                    // Shape of the real phone's first request: direct protobuf.
+                    let request = [8, 1, 26, 2, 8, 7];
+                    peer.send(&ft::seal(&key, &ft::sdk_bytes(&request).unwrap()).unwrap())
+                        .unwrap();
+                    continue;
+                };
+                let sdk = ft::frame(&plain).unwrap();
+                let fields = ft::nodes(sdk.value).unwrap();
+                match sdk.tag {
+                    1 => {
+                        let reply = fields[0].value;
+                        match number(reply, 1) {
+                            Some(3) => {
+                                assert!(crate::wire::bytes_field(reply, 5).is_some());
+                                metadata = true;
+                                let request = [8, 4, 50, 2, 8, 7];
+                                peer.send(
+                                    &ft::seal(&key, &ft::sdk_bytes(&request).unwrap()).unwrap(),
+                                )
+                                .unwrap();
+                            }
+                            Some(5) => assert!(crate::wire::bytes_field(reply, 7).is_some()),
+                            _ => panic!("Unexpected clipboard reply"),
+                        }
+                    }
+                    2 => {
+                        assert!(metadata);
+                        let id = u32::from_be_bytes(fields[0].value.try_into().unwrap());
+                        assert_eq!(u32::from_be_bytes(fields[1].value.try_into().unwrap()), 1);
+                        stream_id = Some(id);
+                        let header = ft::nodes(&fields[2].value[2..]).unwrap();
+                        let attrs = ft::nodes(header[0].value).unwrap();
+                        assert_eq!(
+                            u64::from_be_bytes(attrs[0].value.try_into().unwrap()),
+                            content.len() as u64
+                        );
+                        peer.send(&ft::seal(&key, &ft::sdk_event(id, 2).unwrap()).unwrap())
+                            .unwrap();
+                    }
+                    3 => {
+                        assert_eq!(
+                            Some(u32::from_be_bytes(fields[0].value.try_into().unwrap())),
+                            stream_id
+                        );
+                        let offset = i64::from_be_bytes(fields[1].value.try_into().unwrap());
+                        let count =
+                            u32::from_be_bytes(fields[2].value.try_into().unwrap()) as usize;
+                        assert_eq!(count, fields[3].value.len());
+                        assert_eq!(server.take_sent(), None);
+                        if ended {
+                            continue;
+                        }
+                        if count == 0 {
+                            assert_eq!(offset, -1);
+                            ended = true;
+                            peer.send(
+                                &ft::seal(&key, &ft::sdk_event(stream_id.unwrap(), 3).unwrap())
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        } else {
+                            assert_eq!(offset as usize, received.len());
+                            received.extend(fields[3].value);
+                            if completion_at_size && received.len() == content.len() {
+                                ended = true;
+                                peer.send(
+                                    &ft::seal(&key, &ft::sdk_event(stream_id.unwrap(), 3).unwrap())
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
+                    _ => panic!("Unexpected SDK frame"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ended);
+        assert_eq!(received, content);
+        assert_eq!(server.take_sent(), Some(1));
+        assert!(server.completed());
+        drop(server);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[cfg(feature = "file-sharing")]
     #[test]
     fn resident_receiver_does_not_capture_packets() {

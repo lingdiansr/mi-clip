@@ -29,10 +29,23 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                     SyncEvent::Received(_) | SyncEvent::Sent(_) => ("已连接", String::new()),
                     SyncEvent::Unsupported => ("已连接", "已跳过超出长度限制的内容".into()),
                     SyncEvent::FileClipboardSkipped => {
-                        ("已连接", "暂不支持文件剪贴板同步，已跳过".into())
+                        ("已连接", "该文件暂不支持同步，请复制普通文件后重试".into())
+                    }
+                    SyncEvent::FileClipboardOffered(files) => (
+                        "已连接",
+                        format!("{files} 个文件已就绪 · 可在手机兼容应用粘贴"),
+                    ),
+                    SyncEvent::FileClipboardRequested => {
+                        ("已连接", "手机正在取用复制的文件".into())
+                    }
+                    SyncEvent::FileClipboardSent(files) => {
+                        ("已连接", format!("已向手机发送 {files} 个文件"))
+                    }
+                    SyncEvent::FileClipboardFailed => {
+                        ("已连接", "文件取用失败 · 请重新复制后粘贴".into())
                     }
                     SyncEvent::UnsupportedClipboard => {
-                        ("已连接", "此内容暂不支持 · 当前仅同步短文本".into())
+                        ("已连接", "手机复制的此类内容暂不支持".into())
                     }
                 };
                 let _ = events.try_send(TrayEvent::Status(status.0, status.1));
