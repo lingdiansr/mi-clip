@@ -19,5 +19,6 @@
 !/tools/
 !/tools/generate_icon.py
 !/tools/build-release.sh
+!/tools/prepare-release.py
 !/tests/
 !/tests/*.py

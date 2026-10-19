@@ -25,21 +25,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Check tag matches Cargo version
+      - name: Read release version from tag
         id: version
         shell: python
         run: |
           import os
           import re
-          import tomllib
-          from pathlib import Path
 
           tag = os.environ['RELEASE_TAG']
-          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
           if not re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', tag):
               raise SystemExit('Use a stable version tag such as v0.2.0.')
-          if tag != f'v{version}':
-              raise SystemExit('Tag must match package.version in Cargo.toml.')
+          version = tag[1:]
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'version={version}\n')
       - name: Require release secrets before building
@@ -82,6 +78,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set Cargo version for this release
+        run: python3 tools/prepare-release.py "$RELEASE_VERSION"
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.arch }}

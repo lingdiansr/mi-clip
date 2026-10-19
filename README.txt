@@ -103,7 +103,8 @@ UI 按需创建，正常驻留不运行 Rhai 面板或隐藏主窗口。
 - 本地开发构建不配置更新源时，不进行可用更新安装。
 
 更新发布
-推送与 Cargo.toml 版本一致的稳定 tag（例如 v0.2.0）后，GitHub Actions 会：
+推送稳定 tag（例如 v0.2.0）后，GitHub Actions 会：
+- 从 tag 提取发布版本，在 CI 临时检出目录同步 Cargo.toml 和 Cargo.lock 后再编译，无需手动改版本或提交回仓库。
 - 分别在 Intel 和 Apple Silicon 的 macOS runner 上测试并编译优化后的二进制。
 - 校验 Rhai 脚本、合成设备协议和更新签名，生成二进制、签名清单及 SHA-256 文件。
 - 等两个架构均成功后上传到 GitHub Release，完成上传后再公开新 Release。
@@ -111,7 +112,7 @@ UI 按需创建，正常驻留不运行 Rhai 面板或隐藏主窗口。
 仓库 Actions Secret MI_CLIP_SIGNING_KEY 需保存现有 32 字节 P-256 发布私钥的 Base64。
 仓库 Actions Secret FEISHU_WEBHOOK_URL 保存飞书机器人的 Webhook 地址，不写入源码。
 工作流只上传 release-assets 中的发布文件，签名私钥与配置在临时目录中使用后删除。
-只接受 v主版本.次版本.修订版本，且必须与 Cargo.toml 一致；不发布预览版或裸数字 tag。
+只接受 v主版本.次版本.修订版本；不发布预览版或裸数字 tag。源码中的 Cargo 版本仅用于本地开发。
 
 构建脚本从 origin 的 GitHub 地址推导更新仓库，也可通过环境变量指定：
   MI_CLIP_UPDATE_REPOSITORY=owner/mi-clip ./tools/build-release.sh --bin mi-clip
@@ -130,7 +131,9 @@ UI 按需创建，正常驻留不运行 Rhai 面板或隐藏主窗口。
 
 把生成的 mi-clip-macos-x86_64 和 manifest-macos-x86_64.json 放到 v0.1.0 Release。
 ARM 构建使用 arch=aarch64 和对应名称。只有 x86_64 已在本机验证。
-发布版本号必须同时更新 Cargo.toml 并递增，签名清单和二进制的版本必须一致。
+每次发布使用递增的 tag，CI 确保签名清单和二进制版本一致。手动发布时，先用 Python 3.11+ 执行
+  python3 tools/prepare-release.py 0.2.0
+再编译二进制，并在签名配置中使用相同版本。
 签名配置、私钥及发布输出应保存在源码目录之外。
 
 更新验证
