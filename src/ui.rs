@@ -53,7 +53,7 @@ pub struct Panel {
     _blur: Subscription,
     _outside_click: OutsideClickMonitor,
     events: async_channel::Sender<crate::tray::TrayEvent>,
-    update_label: String,
+    pub(crate) update_label: String,
     content_height: f32,
 }
 impl Panel {
@@ -171,8 +171,7 @@ impl Drop for OutsideClickMonitor {
     }
 }
 impl Render for Panel {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let events = self.events.clone();
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let checking = self.update_label == "检查中…";
         let content = match &self.view {
             Ok(view) => view
@@ -224,12 +223,27 @@ impl Render for Panel {
                                 .rounded(px(6.0))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(rgba(0x2b3038ff)))
-                                .on_click(move |_, _, _| {
+                                .on_click(cx.listener(move |panel, _, _, cx| {
                                     if !checking {
-                                        let _ =
-                                            events.try_send(crate::tray::TrayEvent::CheckUpdate);
+                                        if std::env::var_os("MICLIP_UPDATE_DIAGNOSTICS").is_some() {
+                                            eprintln!("Mi Clip update: button clicked");
+                                        }
+                                        let label = if panel
+                                            .events
+                                            .try_send(crate::tray::TrayEvent::CheckUpdate)
+                                            .is_ok()
+                                        {
+                                            if panel.update_label.starts_with("更新至 ") {
+                                                "正在安装…"
+                                            } else {
+                                                "检查中…"
+                                            }
+                                        } else {
+                                            "请求失败，点击重试"
+                                        };
+                                        panel.update_label(label, cx);
                                     }
-                                })
+                                }))
                                 .child(self.update_label.clone()),
                         )
                         .child(

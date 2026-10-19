@@ -19,6 +19,26 @@ actions!(mi_clip, [ClosePanel, Quit]);
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--version"] {
+        println!("Mi Clip {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.as_slice() == ["--check-update"] {
+        println!(
+            "Mi Clip {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            mi_clip::updater::REPOSITORY
+        );
+        match mi_clip::updater::check()? {
+            mi_clip::updater::Check::Current => println!("已是最新版本"),
+            mi_clip::updater::Check::Unpublished => println!("更新尚未发布"),
+            mi_clip::updater::Check::Ready(update) => println!(
+                "发现并验证更新 {}；打开状态面板重新检查并安装。",
+                update.version()
+            ),
+        }
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("--auth") {
         return mi_clip::auth_cli::run(&args[1..]);
     }
@@ -46,11 +66,12 @@ fn main() -> anyhow::Result<()> {
     }
     if argument == Some("--help") {
         println!(
-            "Mi Clip — standalone Xiaomi clipboard client\nNo main window. Click the menu-bar icon for status.\n--config PATH: use a private account configuration\n--auth COMMAND INPUT OUTPUT: account setup and research CLI\n--check-ui: validate embedded Rhai scripts\n--smoke-test: exercise status button and popup lifecycle\n--probe HOST PORT: test device-info negotiation only\nSupports inline UTF-8 text up to 3 KiB, Mac file clipboard offers, and native phone file sharing to ~/Downloads. No vendor runtime required."
+            "Mi Clip — standalone Xiaomi clipboard client\nNo main window. Click the menu-bar icon for status.\n--version: print the current version\n--check-update: check and verify an update without installing\n--config PATH: use a private account configuration\n--auth COMMAND INPUT OUTPUT: account setup and research CLI\n--check-ui: validate embedded Rhai scripts\n--smoke-test: exercise status button and popup lifecycle\n--probe HOST PORT: test device-info negotiation only\nSupports inline UTF-8 text up to 3 KiB, Mac file clipboard offers, and native phone file sharing to ~/Downloads. No vendor runtime required."
         );
         return Ok(());
     }
     let smoke = argument == Some("--smoke-test");
+    let config = if smoke { None } else { config };
     if argument.is_some() && !smoke {
         anyhow::bail!("Unknown argument; use --help");
     }

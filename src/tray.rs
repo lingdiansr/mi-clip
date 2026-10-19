@@ -181,11 +181,11 @@ pub fn install(
     if let Some(config) = config {
         crate::worker::start(config, sender.clone(), stop.clone());
     }
-    let update_request = if smoke.is_none() {
-        Some(crate::update_ui::start(sender.clone(), stop.clone()))
+    let update_request = Some(if smoke.is_none() {
+        crate::update_ui::start(sender.clone(), stop.clone())
     } else {
-        None
-    };
+        crate::update_ui::start_smoke(sender.clone(), stop.clone())
+    });
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(28.0);
     let button = item
         .button(mtm)
@@ -218,7 +218,7 @@ pub fn install(
             }
             if quitting.get() {
                 passed.set(true);
-                println!("PASS: native file feedback frames, completion badge acknowledgement, toggle, Escape, outside-close event and Quit");
+                println!("PASS: native file feedback frames, completion badge acknowledgement, update click feedback, toggle, Escape, outside-close event and Quit");
             }
             std::future::ready(())
         }).detach();
@@ -323,7 +323,16 @@ pub fn install(
                             .and_then(|w| w.downcast::<Panel>())
                             .ok_or_else(|| anyhow::anyhow!("Popup missing before refresh"))?;
                         handle.update(cx, |panel, window, cx| {
-                            panel.refresh("已连接", "测试状态更新", window, cx)
+                            panel.refresh(
+                                "已连接",
+                                if step == 0 { "" } else { "测试状态更新" },
+                                window,
+                                cx,
+                            )?;
+                            if step == 0 {
+                                panel.update_label("已是最新 · 检查更新", cx);
+                            }
+                            Ok::<(), anyhow::Error>(())
                         })??;
                         Ok(())
                     })?;
@@ -347,9 +356,13 @@ pub fn install(
                         cx.update_window(handle.into(), |_, window, cx| -> anyhow::Result<()> {
                             if step == 1 {
                                 window.dispatch_keystroke(Keystroke::parse("escape")?, cx);
-                            } else if step == 3 {
+                            } else if step == 0 || step == 3 {
                                 // Real GPUI hit testing at the footer, not a direct callback.
-                                let position = point(px(244.0), px(92.0));
+                                let position = if step == 0 {
+                                    point(px(60.0), px(68.0))
+                                } else {
+                                    point(px(244.0), px(92.0))
+                                };
                                 window.dispatch_event(
                                     PlatformInput::MouseMove(gpui_rhai::gpui::MouseMoveEvent {
                                         position,
@@ -379,12 +392,53 @@ pub fn install(
                             Ok(())
                         })??;
                         if step == 0 {
-                            unsafe {
-                                test_button.performClick(None);
-                            }
+                            handle.update(cx, |panel, _, _| -> anyhow::Result<()> {
+                                anyhow::ensure!(
+                                    panel.update_label == "检查中…",
+                                    "Update click did not immediately change its label"
+                                );
+                                Ok(())
+                            })??;
                         }
                         Ok(())
                     })?;
+                    if step == 0 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(250))
+                            .await;
+                        cx.update(|cx| -> anyhow::Result<()> {
+                            let handle = cx.windows()[0]
+                                .downcast::<Panel>()
+                                .ok_or_else(|| anyhow::anyhow!("Update popup disappeared"))?;
+                            handle.update(cx, |panel, _, _| -> anyhow::Result<()> {
+                                anyhow::ensure!(
+                                    panel.update_label == "检查中…",
+                                    "Fast result hid the checking state before it could be seen"
+                                );
+                                Ok(())
+                            })??;
+                            Ok(())
+                        })?;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1500))
+                            .await;
+                        cx.update(|cx| -> anyhow::Result<()> {
+                            let handle = cx.windows()[0]
+                                .downcast::<Panel>()
+                                .ok_or_else(|| anyhow::anyhow!("Update popup disappeared"))?;
+                            handle.update(cx, |panel, _, _| -> anyhow::Result<()> {
+                                anyhow::ensure!(
+                                    panel.update_label == "已是最新 · 检查更新",
+                                    "Fast update check did not finish"
+                                );
+                                Ok(())
+                            })??;
+                            unsafe {
+                                test_button.performClick(None);
+                            }
+                            Ok(())
+                        })?;
+                    }
                     if step == 2 {
                         // Exercise the event sent by the native mouse monitor.
                         // macOS may deny activation to an automated background
@@ -465,13 +519,28 @@ pub fn install(
                         return Ok(());
                     }
                     TrayEvent::CheckUpdate => {
+                        if std::env::var_os("MICLIP_UPDATE_DIAGNOSTICS").is_some() {
+                            eprintln!("Mi Clip update: manual request received");
+                        }
                         if runtime.update.lock().unwrap().is_some() {
                             runtime
                                 .install_update
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             cx.quit();
                         } else if let Some(request) = &update_request {
-                            let _ = request.try_send(());
+                            update_text = match request.try_send(()) {
+                                Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => "检查中…",
+                                Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                                    "检查服务已停止，请重启"
+                                }
+                            }
+                            .into();
+                        } else {
+                            update_text = "检查服务未启动".into();
+                        }
+                        if let Some(opened) = panel.as_ref() {
+                            let _ = opened
+                                .update(cx, |panel, _, cx| panel.update_label(&update_text, cx));
                         }
                         return Ok(());
                     }
@@ -479,7 +548,7 @@ pub fn install(
                         use crate::update_ui::Notice;
                         update_text = match notice {
                             Notice::Checking => "检查中…".into(),
-                            Notice::Current => "已是最新版本".into(),
+                            Notice::Current => "已是最新 · 检查更新".into(),
                             Notice::Unpublished => "更新尚未发布".into(),
                             Notice::Failed => "重试检查更新".into(),
                             Notice::Ready(update) => {
@@ -488,6 +557,9 @@ pub fn install(
                                 text
                             }
                         };
+                        if std::env::var_os("MICLIP_UPDATE_DIAGNOSTICS").is_some() {
+                            eprintln!("Mi Clip update state: {update_text}");
+                        }
                         if let Some(opened) = panel.as_ref() {
                             let _ = opened
                                 .update(cx, |panel, _, cx| panel.update_label(&update_text, cx));
