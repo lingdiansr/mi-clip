@@ -13,21 +13,28 @@ use std::{
 pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut backoff = 2;
+        let mut last_error = String::new();
         while !stop.load(Ordering::Relaxed) {
-            let _ = events.try_send(TrayEvent::Status("连接中", "请保持手机互联功能开启".into()));
+            let _ = events.try_send(TrayEvent::Status("连接中", last_error.clone()));
             let connected = std::cell::Cell::new(false);
-            let _ = handshake::sync_once(&config, &stop, &|event| {
+            let phase = std::cell::Cell::new("发现设备／读取配置");
+            let result = handshake::sync_once(&config, &stop, &|event| {
                 let status = match event {
                     SyncEvent::File(event) => {
                         let _ = events.send_blocking(TrayEvent::File(event));
                         return;
                     }
                     SyncEvent::Connecting(endpoint) => {
+                        phase.set("建立设备通道");
                         let _ = events.send_blocking(TrayEvent::Connecting(endpoint));
-                        ("连接中", "正在建立设备通道".into())
+                        ("连接中", last_error.clone())
                     }
-                    SyncEvent::Authenticating => ("认证中", "正在验证双方身份".into()),
+                    SyncEvent::Authenticating => {
+                        phase.set("设备认证");
+                        ("认证中", last_error.clone())
+                    }
                     SyncEvent::Connected => {
+                        phase.set("已连接／同步");
                         connected.set(true);
                         ("已连接", String::new())
                     }
@@ -67,9 +74,21 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             if connected.get() {
                 backoff = 2;
             }
+            last_error = match result {
+                Err(error) => {
+                    let detail = format!("{}失败：{error:#}", phase.get());
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    eprintln!("[{timestamp}] Mi Clip: {detail}; retry in {backoff}s");
+                    detail
+                }
+                Ok(()) => "连接已结束".into(),
+            };
             let _ = events.try_send(TrayEvent::Status(
                 "等待重连",
-                "手机离线或认证失效 · 自动重试".into(),
+                format!("{last_error} · {backoff} 秒后重试"),
             ));
             for _ in 0..backoff * 4 {
                 if stop.load(Ordering::Relaxed) {
@@ -80,4 +99,40 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             backoff = (backoff * 2).min(30);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_config_reports_the_error_and_keeps_it_during_retry() {
+        let (events, receiver) = async_channel::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let missing = std::env::temp_dir()
+            .join(format!("mi-clip-missing-{}", std::process::id()))
+            .join("config.json");
+        assert!(!missing.exists());
+        start(missing, events, stop.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut failure = None;
+        let mut retained = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(TrayEvent::Status(status, detail)) = receiver.try_recv() {
+                if status == "等待重连" {
+                    assert!(detail.contains("发现设备／读取配置失败"));
+                    assert!(detail.contains("os error 2"));
+                    assert!(detail.contains("2 秒后重试"));
+                    failure = Some(detail);
+                } else if status == "连接中" && failure.is_some() {
+                    retained = detail.contains("os error 2");
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(failure.is_some(), "connection error was not reported");
+        assert!(retained, "retry cleared the previous connection error");
+    }
 }

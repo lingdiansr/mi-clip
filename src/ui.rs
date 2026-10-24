@@ -48,7 +48,18 @@ pub fn prepare_status(status: &str, detail: &str) -> anyhow::Result<PreparedScri
 }
 
 fn content_height(detail: &str) -> f32 {
-    if detail.is_empty() { 48.0 } else { 72.0 }
+    if detail.is_empty() {
+        return 48.0;
+    }
+    // Reserve wrapped lines for the full connection error chain.
+    let lines: usize = detail
+        .lines()
+        .map(|line| {
+            let units: usize = line.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+            units.div_ceil(36).max(1)
+        })
+        .sum();
+    54.0 + lines as f32 * 18.0
 }
 pub const PANEL_WIDTH: f32 = 280.0;
 pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels> {
