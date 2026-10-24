@@ -118,6 +118,13 @@ UI 按需创建，正常驻留不运行 Rhai 面板或隐藏主窗口。
 工作流只上传 release-assets 中的发布文件，签名私钥与配置在临时目录中使用后删除。
 只接受 v主版本.次版本.修订版本；不发布预览版或裸数字 tag。源码中的 Cargo 版本仅用于本地开发。
 
+发布缓存预热
+默认分支 push 或在默认分支手动运行 Warm macOS release cache，会分别预热 Intel 和 Apple Silicon 的协议/更新测试及 Release 依赖。
+预热与发布使用相同的 runner、Rust 工具链、macOS 12.0 部署目标，以及 tools/build-release.sh 的路径重映射参数；每种架构共用一个缓存 key。发布任务只恢复缓存，不再保存无法跨标签复用的副本。
+首次启用时，先等默认分支两个架构的预热全部成功，再推送下一个版本 tag。首次预热需要完整编译，会增加默认分支的 CI 用量。
+发布时按 tag 替换本项目版本的逻辑保持不变，缓存按依赖信息复用；应用自身仍需编译和链接。依赖或工具链变化时可能需要重建，实际提速需在后续发布中确认。
+现有 opt-level=s、fat LTO、单 codegen unit 等发布优化设置保持不变。
+
 构建脚本从 origin 的 GitHub 地址推导更新仓库，也可通过环境变量指定：
   MI_CLIP_UPDATE_REPOSITORY=owner/mi-clip ./tools/build-release.sh --bin mi-clip
 

@@ -85,7 +85,10 @@ jobs:
         run: python3 tools/prepare-release.py "$RELEASE_VERSION"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.arch }}
+          shared-key: macos-release-${{ matrix.arch }}
+          # Seeded by the default-branch ci.yml jobs for both architectures.
+          # Tag-scoped caches cannot be reused by the next release.
+          save-if: 'false'
       - name: Test protocol and updater
         run: cargo test --locked --no-default-features --features research --lib
       - name: Build optimized binary
