@@ -3,7 +3,7 @@
 !/.gitignore
 !/Cargo.toml
 !/Cargo.lock
-!/README.txt
+!/README.md
 !/.github/
 !/.github/workflows/
 !/.github/workflows/release.yml
@@ -17,6 +17,8 @@
 !/assets/
 !/assets/status-template.svg
 !/assets/status-template.pdf
+!/assets/macos-panel.png
+!/assets/phone-share.png
 !/tools/
 !/tools/generate_icon.py
 !/tools/build-release.sh
