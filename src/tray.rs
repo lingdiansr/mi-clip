@@ -26,6 +26,10 @@ pub(crate) enum TrayEvent {
     File(FileEvent),
     AnimationTick,
     CheckUpdate,
+    RefreshDevices,
+    Discovering,
+    Devices(Result<Vec<crate::devices::Device>, ()>),
+    Connecting(std::net::SocketAddr),
     Update(crate::update_ui::Notice),
 }
 struct ActionState {
@@ -181,6 +185,11 @@ pub fn install(
     if let Some(config) = config {
         crate::worker::start(config, sender.clone(), stop.clone());
     }
+    let discovery_request = if testing {
+        None
+    } else {
+        Some(crate::devices::start(sender.clone(), stop.clone()))
+    };
     let update_request = Some(if smoke.is_none() {
         crate::update_ui::start(sender.clone(), stop.clone())
     } else {
@@ -295,6 +304,18 @@ pub fn install(
                         })?;
                     }
                 }
+                // Populate enough synthetic peers to exercise the scroll area.
+                test_events
+                    .send(TrayEvent::Devices(Ok((0..8)
+                        .map(|i| crate::devices::Device {
+                            name: format!("测试设备 {i}"),
+                            host: format!("fixture-{i}.local."),
+                            port: 1234,
+                            device_type: if i == 0 { 1 } else { 2 },
+                            addresses: vec![format!("192.0.2.{}:1234", i + 1).parse().unwrap()],
+                        })
+                        .collect())))
+                    .await?;
                 cx.update(|cx| -> anyhow::Result<()> {
                     anyhow::ensure!(cx.windows().is_empty(), "Unexpected startup window");
                     // SAFETY: Retained target and button, main thread.
@@ -350,6 +371,14 @@ pub fn install(
                             .ok_or_else(|| anyhow::anyhow!("Wrong root"))?;
                         handle.update(cx, |panel, window, cx| -> anyhow::Result<()> {
                             panel.validate(cx)?;
+                            anyhow::ensure!(
+                                panel.device_count() == 8,
+                                "Device discovery did not reach the popup"
+                            );
+                            anyhow::ensure!(
+                                window.viewport_size().height >= px(320.0),
+                                "Device list was clipped by the popup"
+                            );
                             let _ = window;
                             Ok(())
                         })??;
@@ -501,6 +530,7 @@ pub fn install(
         let mut animation_pending = false;
         let mut last_notification: Option<Instant> = None;
         let mut panel: Option<WindowHandle<Panel>> = None;
+        let mut devices = crate::devices::Devices::default();
         let mut status_text = "尚未连接";
         let mut detail_text = "请先完成设备登录".to_owned();
         let mut update_text = if std::env::var_os("MICLIP_UPDATE_ROLLBACK").is_some() {
@@ -515,6 +545,40 @@ pub fn install(
                     TrayEvent::Close => {
                         if let Some(opened) = panel.take() {
                             let _ = opened.update(cx, |_, window, _| window.remove_window());
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::RefreshDevices => {
+                        if let Some(request) = &discovery_request {
+                            let _ = request.try_send(());
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::Discovering => {
+                        devices.scanning = true;
+                        if let Some(opened) = panel.as_ref() {
+                            let _ = opened
+                                .update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx));
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::Devices(result) => {
+                        devices.scanning = false;
+                        devices.failed = result.is_err();
+                        if let Ok(entries) = result {
+                            devices.entries = entries;
+                        }
+                        if let Some(opened) = panel.as_ref() {
+                            let _ = opened
+                                .update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx));
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::Connecting(endpoint) => {
+                        devices.target = Some(endpoint);
+                        if let Some(opened) = panel.as_ref() {
+                            let _ = opened
+                                .update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx));
                         }
                         return Ok(());
                     }
@@ -675,6 +739,9 @@ pub fn install(
                         return Ok(());
                     }
                 }
+                if let Some(request) = &discovery_request {
+                    let _ = request.try_send(());
+                }
                 let detail = visible_detail(&feedback, &detail_text);
                 // Rhai compilation and native popup allocation happen only on demand.
                 let prepared = ui::prepare_status(status_text, &detail)?;
@@ -697,6 +764,7 @@ pub fn install(
                                 prepared,
                                 sender.clone(),
                                 update_text.clone(),
+                                status_text,
                                 &detail,
                                 window,
                                 cx,
@@ -704,6 +772,7 @@ pub fn install(
                         })
                     },
                 )?;
+                opened.update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx))?;
                 panel = Some(opened);
                 cx.activate(true);
                 opened.update(cx, |_, window, _| window.activate_window())?;

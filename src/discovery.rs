@@ -74,6 +74,7 @@ pub struct Endpoint {
     pub interface: u32,
     pub kcp_port: u16,
     pub device_type: u8,
+    pub model: Option<String>,
 }
 #[derive(Default)]
 struct State {
@@ -138,6 +139,10 @@ unsafe extern "C" fn resolved(
             interface,
             kcp_port: port,
             device_type: ad.device_type,
+            model: ad
+                .model
+                .filter(|s| !s.chars().any(char::is_control))
+                .map(str::to_owned),
         });
     }
 }

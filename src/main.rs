@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+mod devices;
 mod notifications;
 mod probe;
 mod tray;

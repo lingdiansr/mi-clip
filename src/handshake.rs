@@ -547,6 +547,8 @@ pub fn save_endpoints(path: &Path, endpoints: &[crate::discovery::Endpoint]) -> 
 /// Configuration and raw replies stay in a private research directory.
 #[derive(Clone, Copy, Debug)]
 pub enum SyncEvent {
+    Connecting(SocketAddr),
+    Authenticating,
     Connected,
     Received(usize),
     Sent(usize),
@@ -669,6 +671,7 @@ fn exchange(
     } else {
         "[::]:0"
     };
+    on_event(SyncEvent::Connecting(config.endpoint));
     let socket = UdpSocket::bind(bind)?;
     socket.connect(config.endpoint)?;
     #[cfg(feature = "file-sharing")]
@@ -678,6 +681,7 @@ fn exchange(
     save("ephemeral-key.bin", &key.to_bytes())?;
     save("request.bin", &request)?;
     transport.send(&request)?;
+    on_event(SyncEvent::Authenticating);
     let started = Instant::now();
     let deadline = started
         + Duration::from_secs(if stop.is_some() {

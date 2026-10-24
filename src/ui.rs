@@ -44,7 +44,7 @@ fn content_height(detail: &str) -> f32 {
 }
 pub const PANEL_WIDTH: f32 = 280.0;
 pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels> {
-    gpui_rhai::gpui::size(px(PANEL_WIDTH), px(content_height(detail) + 40.0))
+    gpui_rhai::gpui::size(px(PANEL_WIDTH), px(content_height(detail) + 40.0 + 232.0))
 }
 
 pub struct Panel {
@@ -55,8 +55,17 @@ pub struct Panel {
     events: async_channel::Sender<crate::tray::TrayEvent>,
     pub(crate) update_label: String,
     content_height: f32,
+    devices: crate::devices::Devices,
+    status: String,
 }
 impl Panel {
+    pub(crate) fn device_count(&self) -> usize {
+        self.devices.entries.len()
+    }
+    pub(crate) fn set_devices(&mut self, devices: crate::devices::Devices, cx: &mut Context<Self>) {
+        self.devices = devices;
+        cx.notify();
+    }
     pub fn update_label(&mut self, label: &str, cx: &mut Context<Self>) {
         self.update_label = label.to_owned();
         cx.notify();
@@ -68,6 +77,7 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        self.status = status.to_owned();
         let prepared = prepare_status(status, detail)?;
         self.content_height = content_height(detail);
         window.resize(panel_size(detail));
@@ -115,6 +125,7 @@ impl Panel {
         prepared: PreparedScriptView,
         events: async_channel::Sender<crate::tray::TrayEvent>,
         update_label: String,
+        status: &str,
         detail: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -140,6 +151,8 @@ impl Panel {
             events,
             update_label,
             content_height: content_height(detail),
+            devices: Default::default(),
+            status: status.into(),
         }
     }
 }
@@ -182,6 +195,51 @@ impl Render for Panel {
                 .p(px(16.0))
                 .child(format!("界面加载失败：{error}"))
                 .into_any_element(),
+        };
+        let rows = self.devices.rows(&self.status);
+        let empty = rows.is_empty();
+        let mut list = div()
+            .id("device-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll();
+        for (name, detail) in rows {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .py(px(7.0))
+                    .child(div().text_ellipsis().child(name))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgba(0xa4acbaff))
+                            .text_ellipsis()
+                            .child(detail),
+                    ),
+            );
+        }
+        if empty {
+            list = list.child(div().py(px(12.0)).text_color(rgba(0xa4acbaff)).child(
+                if self.devices.scanning {
+                    "正在发现局域网设备…"
+                } else if self.devices.failed {
+                    "发现失败，请刷新重试"
+                } else {
+                    "未发现设备"
+                },
+            ));
+        }
+        let has_phone = self.devices.entries.iter().any(|d| d.device_type == 1);
+        let discovery_note = if self.devices.failed {
+            "发现失败 · 列表为上次结果"
+        } else if self.status == "已连接" {
+            "双方认证通过 · 连接已建立"
+        } else if !has_phone {
+            "未发现手机 · 请解锁并开启互联"
+        } else {
+            "发现后自动连接同账号手机"
         };
         self.host.container(
             div()
@@ -257,6 +315,63 @@ impl Render for Panel {
                                 .hover(|style| style.bg(rgba(0x2b3038ff)))
                                 .on_click(|_, _, cx| cx.quit())
                                 .child("退出"),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(232.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .px(px(14.0))
+                        .pb(px(10.0))
+                        .border_t_1()
+                        .border_color(rgba(0x30343cff))
+                        .child(
+                            div()
+                                .h(px(36.0))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child("局域网设备")
+                                .child(
+                                    div()
+                                        .id("refresh-devices")
+                                        .cursor_pointer()
+                                        .px(px(6.0))
+                                        .py(px(5.0))
+                                        .rounded(px(4.0))
+                                        .hover(|s| s.bg(rgba(0x2b3038ff)))
+                                        .on_click(cx.listener(|panel, _, _, cx| {
+                                            if !panel.devices.scanning {
+                                                if panel
+                                                    .events
+                                                    .try_send(
+                                                        crate::tray::TrayEvent::RefreshDevices,
+                                                    )
+                                                    .is_ok()
+                                                {
+                                                    panel.devices.scanning = true;
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }))
+                                        .child(if self.devices.scanning {
+                                            "发现中…"
+                                        } else {
+                                            "刷新"
+                                        }),
+                                ),
+                        )
+                        .child(list)
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .pt(px(6.0))
+                                .text_size(px(10.0))
+                                .text_color(rgba(0xa4acbaff))
+                                .child(discovery_note),
                         ),
                 ),
         )

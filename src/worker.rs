@@ -22,6 +22,11 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                         let _ = events.send_blocking(TrayEvent::File(event));
                         return;
                     }
+                    SyncEvent::Connecting(endpoint) => {
+                        let _ = events.send_blocking(TrayEvent::Connecting(endpoint));
+                        ("连接中", "正在建立设备通道".into())
+                    }
+                    SyncEvent::Authenticating => ("认证中", "正在验证双方身份".into()),
                     SyncEvent::Connected => {
                         connected.set(true);
                         ("已连接", String::new())
