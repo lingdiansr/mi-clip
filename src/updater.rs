@@ -155,6 +155,10 @@ pub enum Check {
 }
 
 pub fn check() -> anyhow::Result<Check> {
+    check_with_progress(|_| {})
+}
+
+pub fn check_with_progress(mut downloading: impl FnMut(&str)) -> anyhow::Result<Check> {
     anyhow::ensure!(repository(REPOSITORY), "Update repository not configured");
     let arch = std::env::consts::ARCH;
     let url = format!(
@@ -170,6 +174,7 @@ pub fn check() -> anyhow::Result<Check> {
     if version(&release.version)? <= version(env!("CARGO_PKG_VERSION"))? {
         return Ok(Check::Current);
     }
+    downloading(&release.version);
     let response = http::download(&release.url, release.size)?;
     anyhow::ensure!(response.status == 200, "Update download failed");
     verify_binary(&response.body, &release)?;

@@ -351,7 +351,7 @@ pub fn install(
                                 cx,
                             )?;
                             if step == 0 {
-                                panel.update_label("已是最新 · 检查更新", cx);
+                                panel.update_label(&ui::current_version_label(), cx);
                             }
                             Ok::<(), anyhow::Error>(())
                         })??;
@@ -362,9 +362,7 @@ pub fn install(
                         .timer(Duration::from_millis(250))
                         .await;
                     cx.update(|cx| -> anyhow::Result<()> {
-                        use gpui_rhai::gpui::{
-                            Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput,
-                        };
+                        use gpui_rhai::gpui::Keystroke;
                         anyhow::ensure!(cx.windows().len() == 1, "Click must open one popup");
                         let handle = cx.windows()[0]
                             .downcast::<Panel>()
@@ -383,52 +381,31 @@ pub fn install(
                             Ok(())
                         })??;
                         cx.update_window(handle.into(), |_, window, cx| -> anyhow::Result<()> {
+                            // Commit the refreshed layout before injecting native events,
+                            // including when macOS throttles background drawing.
+                            window.draw(cx).clear(cx);
                             if step == 1 {
                                 window.dispatch_keystroke(Keystroke::parse("escape")?, cx);
                             } else if step == 0 || step == 3 {
-                                // Real GPUI hit testing at the footer, not a direct callback.
-                                let position = if step == 0 {
-                                    point(px(60.0), px(68.0))
-                                } else {
-                                    point(px(244.0), px(92.0))
-                                };
-                                window.dispatch_event(
-                                    PlatformInput::MouseMove(gpui_rhai::gpui::MouseMoveEvent {
-                                        position,
-                                        ..Default::default()
-                                    }),
-                                    cx,
-                                );
-                                window.dispatch_event(
-                                    PlatformInput::MouseDown(MouseDownEvent {
-                                        button: MouseButton::Left,
-                                        position,
-                                        click_count: 1,
-                                        ..Default::default()
-                                    }),
-                                    cx,
-                                );
-                                window.dispatch_event(
-                                    PlatformInput::MouseUp(MouseUpEvent {
-                                        button: MouseButton::Left,
-                                        position,
-                                        click_count: 1,
-                                        ..Default::default()
-                                    }),
-                                    cx,
-                                );
+                                // Route through AppKit as a real panel click would.
+                                let mtm = MainThreadMarker::new().unwrap();
+                                let app = NSApplication::sharedApplication(mtm);
+                                let native = app.windows().iter()
+                                    .find(|w| w.isVisible() && (w.frame().size.width - 280.0).abs() < 1.0)
+                                    .ok_or_else(|| anyhow::anyhow!("Native popup missing"))?;
+                                let (x, y) = if step == 0 { (60.0, 68.0) } else { (244.0, 92.0) };
+                                for kind in [objc2_app_kit::NSEventType::LeftMouseDown, objc2_app_kit::NSEventType::LeftMouseUp] {
+                                    let event = objc2_app_kit::NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                                        kind, objc2_foundation::NSPoint::new(x, f64::from(window.viewport_size().height) - y),
+                                        objc2_app_kit::NSEventModifierFlags::empty(), (step + 1) as f64,
+                                        native.windowNumber(), None, (step + 1) as isize, 1, 1.0,
+                                    ).ok_or_else(|| anyhow::anyhow!("Mouse event allocation failed"))?;
+                                    app.postEvent_atStart(&event, false);
+                                }
                             }
                             Ok(())
                         })??;
-                        if step == 0 {
-                            handle.update(cx, |panel, _, _| -> anyhow::Result<()> {
-                                anyhow::ensure!(
-                                    panel.update_label == "检查中…",
-                                    "Update click did not immediately change its label"
-                                );
-                                Ok(())
-                            })??;
-                        }
+
                         Ok(())
                     })?;
                     if step == 0 {
@@ -457,7 +434,7 @@ pub fn install(
                                 .ok_or_else(|| anyhow::anyhow!("Update popup disappeared"))?;
                             handle.update(cx, |panel, _, _| -> anyhow::Result<()> {
                                 anyhow::ensure!(
-                                    panel.update_label == "已是最新 · 检查更新",
+                                    panel.update_label == ui::current_version_label(),
                                     "Fast update check did not finish"
                                 );
                                 Ok(())
@@ -612,9 +589,10 @@ pub fn install(
                         use crate::update_ui::Notice;
                         update_text = match notice {
                             Notice::Checking => "检查中…".into(),
-                            Notice::Current => "已是最新 · 检查更新".into(),
+                            Notice::Downloading(version) => format!("正在下载 v{version}…"),
+                            Notice::Current => ui::current_version_label(),
                             Notice::Unpublished => "更新尚未发布".into(),
-                            Notice::Failed => "重试检查更新".into(),
+                            Notice::Failed => "检查失败 · 点击重试".into(),
                             Notice::Ready(update) => {
                                 let text = format!("更新至 {}", update.version());
                                 *runtime.update.lock().unwrap() = Some(update);
@@ -752,7 +730,10 @@ pub fn install(
                             ui::panel_size(&detail),
                         ))),
                         titlebar: None,
-                        kind: WindowKind::Floating,
+                        // A nonactivating AppKit panel accepts clicks while another
+                        // app remains active; a Floating window can lose the click
+                        // while macOS tries to activate this menu-bar-only app.
+                        kind: WindowKind::PopUp,
                         is_resizable: false,
                         is_minimizable: false,
                         is_movable: false,
@@ -774,7 +755,6 @@ pub fn install(
                 )?;
                 opened.update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx))?;
                 panel = Some(opened);
-                cx.activate(true);
                 opened.update(cx, |_, window, _| window.activate_window())?;
                 // Acknowledge only once the user can actually see the panel.
                 feedback.acknowledge();

@@ -8,6 +8,10 @@ use gpui_rhai::{
 };
 use std::collections::BTreeMap;
 
+pub fn current_version_label() -> String {
+    format!("已是最新 · v{} · 检查更新", env!("CARGO_PKG_VERSION"))
+}
+
 pub fn prepare() -> anyhow::Result<PreparedScriptView> {
     prepare_status("尚未连接", "请先完成设备登录")
 }
@@ -19,6 +23,10 @@ pub fn prepare_status(status: &str, detail: &str) -> anyhow::Result<PreparedScri
         EmbeddedScriptSource::new(BTreeMap::from([(
             id,
             include_str!("../ui/panel.rhai")
+                .replace(
+                    "\"Mi Clip\"",
+                    &serde_json::to_string(&format!("Mi Clip · v{}", env!("CARGO_PKG_VERSION")))?,
+                )
                 .replace(
                     "\"尚未连接\"",
                     &serde_json::to_string(if online { "✓" } else { status })?,
@@ -185,7 +193,7 @@ impl Drop for OutsideClickMonitor {
 }
 impl Render for Panel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let checking = self.update_label == "检查中…";
+        let checking = self.update_label == "检查中…" || self.update_label.starts_with("正在下载 ");
         let content = match &self.view {
             Ok(view) => view
                 .element()

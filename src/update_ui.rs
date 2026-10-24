@@ -12,6 +12,7 @@ use std::{
 
 pub enum Notice {
     Checking,
+    Downloading(String),
     Current,
     Unpublished,
     Failed,
@@ -19,12 +20,14 @@ pub enum Notice {
 }
 
 pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSender<()> {
-    start_worker(events, stop, Duration::from_secs(10), updater::check)
+    start_worker(events, stop, Duration::from_secs(10), |progress| {
+        updater::check_with_progress(progress)
+    })
 }
 
 // Exercise manual checks and fast responses in the GUI smoke test without network access.
 pub fn start_smoke(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSender<()> {
-    start_worker(events, stop, Duration::from_secs(3600), || {
+    start_worker(events, stop, Duration::from_secs(3600), |_| {
         Ok(Check::Current)
     })
 }
@@ -33,7 +36,7 @@ fn start_worker(
     events: Sender<TrayEvent>,
     stop: Arc<AtomicBool>,
     initial_delay: Duration,
-    mut check: impl FnMut() -> anyhow::Result<Check> + Send + 'static,
+    mut check: impl FnMut(&mut dyn FnMut(&str)) -> anyhow::Result<Check> + Send + 'static,
 ) -> mpsc::SyncSender<()> {
     let (request, receive) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -53,7 +56,10 @@ fn start_worker(
                 break;
             }
             let started = Instant::now();
-            let notice = match check() {
+            let notice = match check(&mut |version| {
+                let _ =
+                    events.send_blocking(TrayEvent::Update(Notice::Downloading(version.into())));
+            }) {
                 Ok(Check::Current) => Notice::Current,
                 Ok(Check::Unpublished) => Notice::Unpublished,
                 Ok(Check::Ready(pending)) => Notice::Ready(pending),
