@@ -336,7 +336,11 @@ impl FileReceiver {
         let (Some(offer), Some(reliable), Some(send)) = (
             self.clipboard.as_ref(),
             self.reliable.as_mut(),
-            self.sends.front_mut(),
+            // Android may open more than one reader before closing the first.
+            // A stream awaiting completion must not block another ready reader.
+            self.sends
+                .iter_mut()
+                .find(|send| send.ready && !send.ending),
         ) else {
             return Ok(());
         };
@@ -345,6 +349,7 @@ impl FileReceiver {
         }
         // Bound each poll and the KCP queue so other clipboard events remain
         // responsive. Read directly from the pinned selection in 16 KiB chunks.
+        let previous = send.offset;
         for _ in 0..4 {
             if reliable.wait_snd() >= 64 {
                 break;
@@ -353,11 +358,8 @@ impl FileReceiver {
             let ending = bytes.is_empty();
             let message = crate::file_transport::sdk_data(
                 send.id,
-                if ending {
-                    -1
-                } else {
-                    i64::try_from(send.offset)?
-                },
+                // Native EOF keeps the final offset; -1 would cancel the stream.
+                i64::try_from(send.offset)?,
                 &bytes,
             )?;
             reliable.send(&crate::file_transport::seal(&self.transfer_key, &message)?)?;
@@ -369,6 +371,15 @@ impl FileReceiver {
             }
         }
         reliable.flush()?;
+        if send.offset != previous || send.ending {
+            file_trace!(
+                self.capture,
+                "Clipboard stream queued: {} bytes; end {}; pending segments {}.",
+                send.offset,
+                send.ending,
+                reliable.wait_snd()
+            );
+        }
         Ok(())
     }
     pub fn port(&self) -> anyhow::Result<u16> {
@@ -389,6 +400,15 @@ impl FileReceiver {
         } else {
             !self.saved.is_empty() && self.saved.iter().all(|saved| *saved)
         }
+    }
+    pub fn trace_peer_close(&self, code: u64) {
+        file_trace!(
+            self.capture,
+            "Phone closed logical file channel: code {code}; streams {}; queued bytes {}; pending segments {}.",
+            self.sends.len(),
+            self.sends.iter().map(|s| s.offset).sum::<u64>(),
+            self.reliable.as_ref().map_or(0, |r| r.wait_snd())
+        );
     }
     fn finish(&mut self) -> anyhow::Result<()> {
         self.done = true;
@@ -463,6 +483,18 @@ impl FileReceiver {
         Ok(())
     }
     pub fn poll(&mut self) -> anyhow::Result<()> {
+        let result = self.poll_inner();
+        if let Err(error) = &result {
+            file_trace!(
+                self.capture,
+                "File transport stopped: {error}; active streams {}; pending segments {}.",
+                self.sends.len(),
+                self.reliable.as_ref().map_or(0, |r| r.wait_snd())
+            );
+        }
+        result
+    }
+    fn poll_inner(&mut self) -> anyhow::Result<()> {
         use std::io::Read;
         if self.done {
             return Ok(());
@@ -770,6 +802,15 @@ impl FileReceiver {
                 } else if let Ok(Some(response)) =
                     crate::file_transport::negotiation_reply(&message, 1)
                 {
+                    let info = crate::file_transport::frame(&message)?;
+                    let fields = crate::file_transport::nodes(info.value)?;
+                    if let Some(maximum) = fields.iter().find(|field| field.tag == 2) {
+                        file_trace!(
+                            self.capture,
+                            "Phone SDK packet limit: {}.",
+                            u32::from_be_bytes(maximum.value.try_into()?)
+                        );
+                    }
                     reliable.send(&response)?;
                     if self.clipboard.is_some() {
                         reliable.flush()?;
@@ -959,11 +1000,18 @@ mod tests {
     #[test]
     fn clipboard_pull_uses_direct_sdk_frames_and_waits_for_phone_completion() {
         for completion_at_size in [false, true] {
-            clipboard_pull(completion_at_size);
+            for image in [false, true] {
+                clipboard_pull(completion_at_size, image, 1);
+            }
         }
     }
     #[cfg(feature = "file-sharing")]
-    fn clipboard_pull(completion_at_size: bool) {
+    #[test]
+    fn concurrent_image_readers_do_not_wait_for_the_first_reader_to_close() {
+        clipboard_pull(false, true, 2);
+    }
+    #[cfg(feature = "file-sharing")]
+    fn clipboard_pull(completion_at_size: bool, image: bool, readers: u32) {
         use crate::file_transport as ft;
         use std::{
             net::{IpAddr, Ipv4Addr, UdpSocket},
@@ -981,9 +1029,19 @@ mod tests {
         let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let key = [0x42; 32];
         let mut server = FileReceiver::open(local, local, None, key, None).unwrap();
-        server.serve_clipboard(Arc::new(
-            crate::clipboard_files::Offer::open(vec![path], 7).unwrap(),
-        ));
+        let offer = if image {
+            crate::clipboard_files::Offer::from_content(
+                crate::clipboard::Content::Image(crate::clipboard::Image {
+                    name: "Clipboard.png",
+                    bytes: content.clone(),
+                }),
+                7,
+            )
+            .unwrap()
+        } else {
+            crate::clipboard_files::Offer::open(vec![path], 7).unwrap()
+        };
+        server.serve_clipboard(Arc::new(offer));
         let socket = UdpSocket::bind((local, 0)).unwrap();
         socket.connect((local, server.port().unwrap())).unwrap();
         socket.set_nonblocking(true).unwrap();
@@ -1001,11 +1059,10 @@ mod tests {
         peer.update(0).unwrap();
         let started = Instant::now();
         let mut packet = [0; 65536];
-        let mut stream_id = None;
-        let mut received: Vec<u8> = Vec::new();
-        let mut ended = false;
+        let mut streams = std::collections::BTreeMap::<u32, (Vec<u8>, bool)>::new();
+        let mut acknowledged = false;
         let mut metadata = false;
-        while started.elapsed() < Duration::from_secs(5) && server.sent == 0 {
+        while started.elapsed() < Duration::from_secs(5) && server.sent < readers {
             server.poll().unwrap();
             peer.update(started.elapsed().as_millis() as u32).unwrap();
             loop {
@@ -1038,10 +1095,12 @@ mod tests {
                                 assert!(crate::wire::bytes_field(reply, 5).is_some());
                                 metadata = true;
                                 let request = [8, 4, 50, 2, 8, 7];
-                                peer.send(
-                                    &ft::seal(&key, &ft::sdk_bytes(&request).unwrap()).unwrap(),
-                                )
-                                .unwrap();
+                                for _ in 0..readers {
+                                    peer.send(
+                                        &ft::seal(&key, &ft::sdk_bytes(&request).unwrap()).unwrap(),
+                                    )
+                                    .unwrap();
+                                }
                             }
                             Some(5) => assert!(crate::wire::bytes_field(reply, 7).is_some()),
                             _ => panic!("Unexpected clipboard reply"),
@@ -1051,7 +1110,7 @@ mod tests {
                         assert!(metadata);
                         let id = u32::from_be_bytes(fields[0].value.try_into().unwrap());
                         assert_eq!(u32::from_be_bytes(fields[1].value.try_into().unwrap()), 1);
-                        stream_id = Some(id);
+                        assert!(streams.insert(id, (Vec::new(), false)).is_none());
                         let header = ft::nodes(&fields[2].value[2..]).unwrap();
                         let attrs = ft::nodes(header[0].value).unwrap();
                         assert_eq!(
@@ -1062,37 +1121,40 @@ mod tests {
                             .unwrap();
                     }
                     3 => {
-                        assert_eq!(
-                            Some(u32::from_be_bytes(fields[0].value.try_into().unwrap())),
-                            stream_id
-                        );
+                        let id = u32::from_be_bytes(fields[0].value.try_into().unwrap());
+                        let (received, ended) =
+                            streams.get_mut(&id).expect("Data before stream header");
                         let offset = i64::from_be_bytes(fields[1].value.try_into().unwrap());
                         let count =
                             u32::from_be_bytes(fields[2].value.try_into().unwrap()) as usize;
                         assert_eq!(count, fields[3].value.len());
-                        assert_eq!(server.take_sent(), None);
-                        if ended {
+                        if *ended {
                             continue;
                         }
+                        assert_eq!(server.sent, 0, "Completion must wait for the phone");
                         if count == 0 {
-                            assert_eq!(offset, -1);
-                            ended = true;
-                            peer.send(
-                                &ft::seal(&key, &ft::sdk_event(stream_id.unwrap(), 3).unwrap())
-                                    .unwrap(),
-                            )
-                            .unwrap();
+                            assert_eq!(offset, content.len() as i64);
+                            *ended = true;
                         } else {
                             assert_eq!(offset as usize, received.len());
                             received.extend(fields[3].value);
                             if completion_at_size && received.len() == content.len() {
-                                ended = true;
+                                *ended = true;
+                            }
+                        }
+                        // Model Android opening two readers and withholding close
+                        // acknowledgements until both have received their bytes.
+                        if !acknowledged
+                            && streams.len() == readers as usize
+                            && streams.values().all(|(_, ended)| *ended)
+                        {
+                            for id in streams.keys() {
                                 peer.send(
-                                    &ft::seal(&key, &ft::sdk_event(stream_id.unwrap(), 3).unwrap())
-                                        .unwrap(),
+                                    &ft::seal(&key, &ft::sdk_event(*id, 3).unwrap()).unwrap(),
                                 )
                                 .unwrap();
                             }
+                            acknowledged = true;
                         }
                     }
                     _ => panic!("Unexpected SDK frame"),
@@ -1100,9 +1162,15 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(ended);
-        assert_eq!(received, content);
-        assert_eq!(server.take_sent(), Some(1));
+        assert_eq!(streams.len(), readers as usize);
+        for (received, ended) in streams.values() {
+            assert!(
+                *ended,
+                "A reader stalled waiting for another reader to close"
+            );
+            assert_eq!(*received, content);
+        }
+        assert_eq!(server.take_sent(), Some(readers));
         assert!(server.completed());
         drop(server);
         std::fs::remove_dir_all(root).unwrap();

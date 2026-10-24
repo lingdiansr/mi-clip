@@ -6,7 +6,35 @@ use objc2_foundation::{NSArray, NSString, NSURL, ns_string};
 pub enum Content {
     Text(String),
     Files(Vec<std::path::PathBuf>),
+    Image(Image),
     Unsupported,
+}
+
+pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+pub struct Image {
+    pub name: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+fn read_image(board: &NSPasteboard) -> Content {
+    // Prefer a phone-friendly encoded representation. Never fall through to
+    // accompanying text when an image is present but cannot be read.
+    for (uti, name) in [
+        ("public.png", "Clipboard.png"),
+        ("public.jpeg", "Clipboard.jpg"),
+        ("com.compuserve.gif", "Clipboard.gif"),
+        ("public.tiff", "Clipboard.tiff"),
+    ] {
+        if let Some(data) = board.dataForType(&NSString::from_str(uti)) {
+            if (1..=MAX_IMAGE_BYTES).contains(&data.length()) {
+                return Content::Image(Image {
+                    name,
+                    bytes: data.to_vec(),
+                });
+            }
+        }
+    }
+    Content::Unsupported
 }
 
 fn read_from(board: &NSPasteboard) -> (isize, Content) {
@@ -58,6 +86,10 @@ fn read_from(board: &NSPasteboard) -> (isize, Content) {
             }
         }
         Content::Files(paths)
+    } else if board
+        .canReadItemWithDataConformingToTypes(&NSArray::from_slice(&[ns_string!("public.image")]))
+    {
+        read_image(board)
     } else {
         board
             .stringForType(unsafe { NSPasteboardTypeString })
@@ -81,6 +113,23 @@ pub fn read_content() -> (isize, Content) {
     autoreleasepool(|_| read_from(&NSPasteboard::generalPasteboard()))
 }
 
+fn read_update_from(
+    board: &NSPasteboard,
+    previous: isize,
+    initial: bool,
+) -> Option<(isize, Content)> {
+    if board.changeCount() == previous && !initial {
+        return None;
+    }
+    let snapshot = read_from(board);
+    // Reoffer an existing image on reconnect, without replaying old text.
+    (snapshot.0 != previous || matches!(&snapshot.1, Content::Image(_))).then_some(snapshot)
+}
+
+pub fn read_update(previous: isize, initial: bool) -> Option<(isize, Content)> {
+    autoreleasepool(|_| read_update_from(&NSPasteboard::generalPasteboard(), previous, initial))
+}
+
 pub fn read() -> (isize, Option<String>) {
     let (count, content) = read_content();
     (
@@ -95,6 +144,7 @@ pub fn read() -> (isize, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_foundation::NSData;
     struct TestBoard(objc2::rc::Retained<NSPasteboard>);
     impl Drop for TestBoard {
         fn drop(&mut self) {
@@ -103,6 +153,67 @@ mod tests {
                 let _: () = objc2::msg_send![&*self.0, releaseGlobally];
             }
         }
+    }
+    #[test]
+    fn copied_image_overrides_text_and_is_reoffered_on_reconnect() {
+        autoreleasepool(|_| {
+            let mut png = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut png, 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&[10, 20, 30, 255])
+                    .unwrap();
+            }
+            let board = TestBoard(NSPasteboard::pasteboardWithUniqueName());
+            assert!(
+                board
+                    .0
+                    .setData_forType(Some(&NSData::with_bytes(&png)), ns_string!("public.png"))
+            );
+            assert!(
+                board
+                    .0
+                    .setString_forType(ns_string!("old accompanying text"), unsafe {
+                        NSPasteboardTypeString
+                    })
+            );
+            let previous = board.0.changeCount();
+            let (_, Content::Image(image)) = read_from(&board.0) else {
+                panic!("Image became text")
+            };
+            assert_eq!(image.bytes, png);
+            assert_eq!(image.name, "Clipboard.png");
+            assert!(matches!(
+                read_update_from(&board.0, previous, true),
+                Some((_, Content::Image(_)))
+            ));
+            assert!(read_update_from(&board.0, previous, false).is_none());
+            assert!(matches!(
+                read_update_from(&board.0, previous - 1, false),
+                Some((_, Content::Image(_)))
+            ));
+
+            board.0.clearContents();
+            assert!(
+                board
+                    .0
+                    .setString_forType(ns_string!("ordinary text"), unsafe {
+                        NSPasteboardTypeString
+                    })
+            );
+            assert!(read_update_from(&board.0, board.0.changeCount(), true).is_none());
+            // A failed image read must never send accompanying text instead.
+            assert!(
+                board
+                    .0
+                    .setData_forType(Some(&NSData::with_bytes(&[])), ns_string!("public.png"))
+            );
+            assert!(matches!(read_from(&board.0).1, Content::Unsupported));
+        });
     }
     #[test]
     fn finder_file_reference_is_resolved_after_file_rename() {

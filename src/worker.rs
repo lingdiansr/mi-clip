@@ -40,6 +40,9 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                         "已连接",
                         format!("{files} 个文件已就绪 · 可在手机兼容应用粘贴"),
                     ),
+                    SyncEvent::ImageClipboardOffered => {
+                        ("已连接", "图片已就绪 · 可在手机兼容应用粘贴".into())
+                    }
                     SyncEvent::FileClipboardRequested => {
                         ("已连接", "手机正在取用复制的文件".into())
                     }

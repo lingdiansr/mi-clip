@@ -555,6 +555,7 @@ pub enum SyncEvent {
     Unsupported,
     FileClipboardSkipped,
     FileClipboardOffered(u32),
+    ImageClipboardOffered,
     FileClipboardRequested,
     FileClipboardSent(u32),
     FileClipboardFailed,
@@ -724,8 +725,8 @@ fn exchange(
         0
     };
     // A manual interoperability run may start after the user copied its test
-    // file. Inspect that current snapshot once; normal resident startup keeps
-    // its existing change-count behavior and never republishes old content.
+    // file. Inspect that current snapshot once; resident startup reoffers only
+    // the current image via read_update and does not replay old text or files.
     #[cfg(all(feature = "research", feature = "clipboard"))]
     if directory.is_some() && config.clipboard_sync {
         clipboard_count = clipboard_count.wrapping_sub(1);
@@ -736,6 +737,8 @@ fn exchange(
     let mut sequence = private::random::<1>()?[0];
     #[cfg(feature = "clipboard")]
     let mut network_ready = false;
+    #[cfg(feature = "clipboard")]
+    let mut initial_clipboard = true;
     while Instant::now() < deadline {
         #[cfg(feature = "file-sharing")]
         if let Some(probe) = port_probe.as_mut() {
@@ -787,8 +790,9 @@ fn exchange(
         );
         #[cfg(feature = "clipboard")]
         if config.clipboard_sync && network_ready && active_key.is_some() {
-            if crate::clipboard::change_count() != clipboard_count {
-                let (count, content) = crate::clipboard::read_content();
+            let snapshot = crate::clipboard::read_update(clipboard_count, initial_clipboard);
+            initial_clipboard = false;
+            if let Some((count, content)) = snapshot {
                 clipboard_count = count;
                 #[cfg(feature = "file-sharing")]
                 {
@@ -803,25 +807,25 @@ fn exchange(
                 }
                 let text = match content {
                     crate::clipboard::Content::Text(text) => Some(text),
-                    crate::clipboard::Content::Files(paths) => {
-                        diagnostic!(
-                            "Concrete clipboard file URL snapshot: {} items.",
-                            paths.len()
-                        );
+                    content @ (crate::clipboard::Content::Files(_)
+                    | crate::clipboard::Content::Image(_)) => {
+                        let image = matches!(&content, crate::clipboard::Content::Image(_));
                         #[cfg(feature = "file-sharing")]
                         {
                             sequence = (sequence % 127) + 1;
-                            match crate::clipboard_files::Offer::open(paths, sequence) {
+                            match crate::clipboard_files::Offer::from_content(content, sequence) {
                                 Ok(offer) => {
                                     transport.send(&encrypted_payload(
                                         active_key.as_ref().unwrap(),
                                         &offer.announcement(),
                                     )?)?;
-                                    on_event(SyncEvent::FileClipboardOffered(
-                                        offer.files.len() as u32
-                                    ));
+                                    on_event(if image {
+                                        SyncEvent::ImageClipboardOffered
+                                    } else {
+                                        SyncEvent::FileClipboardOffered(offer.files.len() as u32)
+                                    });
                                     diagnostic!(
-                                        "Lazy file clipboard announced; {} pinned regular files. No paths or contents printed.",
+                                        "Lazy file/image clipboard announced; {} items. No paths or contents printed.",
                                         offer.files.len()
                                     );
                                     clipboard_offer = Some(std::sync::Arc::new(offer));
@@ -835,7 +839,7 @@ fn exchange(
                         }
                         #[cfg(not(feature = "file-sharing"))]
                         {
-                            let _ = paths;
+                            let _ = content;
                             on_event(SyncEvent::FileClipboardSkipped);
                         }
                         None
@@ -1020,6 +1024,9 @@ fn exchange(
                     file_notice = None;
                     #[cfg(feature = "file-sharing")]
                     {
+                        if let Some(probe) = port_probe.as_ref() {
+                            probe.trace_peer_close(code);
+                        }
                         if !port_probe.as_ref().is_some_and(|probe| probe.completed()) {
                             if file_service.is_some_and(crate::file_channel::clipboard_service) {
                                 on_event(SyncEvent::FileClipboardFailed);

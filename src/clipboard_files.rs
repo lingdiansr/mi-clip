@@ -1,4 +1,4 @@
-//! A single live clipboard offer. Only copied, pinned regular files can be read.
+//! A single live clipboard offer backed by pinned files or an image snapshot.
 //! Peer requests contain numeric item IDs; remote paths are never accepted.
 use crate::wire::{self, Field};
 use std::{
@@ -21,12 +21,15 @@ fn fingerprint(file: &File) -> anyhow::Result<Fingerprint> {
     ))
 }
 pub(crate) struct Source {
-    file: File,
-    fingerprint: Fingerprint,
+    data: SourceData,
     pub name: String,
     pub size: u64,
     pub mime: &'static str,
     code: u8,
+}
+enum SourceData {
+    File(File, Fingerprint),
+    Image(Vec<u8>),
 }
 fn file_type(name: &str) -> (u8, &'static str) {
     // Native MimeMapper codes, cross-checked offline. Unlike universal text
@@ -72,6 +75,31 @@ pub(crate) struct Offer {
     pub files: Vec<Source>,
 }
 impl Offer {
+    pub fn from_content(content: crate::clipboard::Content, sequence: u8) -> anyhow::Result<Self> {
+        match content {
+            crate::clipboard::Content::Files(paths) => Self::open(paths, sequence),
+            crate::clipboard::Content::Image(image) => {
+                anyhow::ensure!(
+                    (1..=crate::clipboard::MAX_IMAGE_BYTES).contains(&image.bytes.len()),
+                    "Clipboard image exceeds size limit"
+                );
+                let (code, mime) = file_type(image.name);
+                let nonce = u64::from_ne_bytes(crate::private::random()?);
+                let extension = image.name.rsplit('.').next().unwrap_or("png");
+                Ok(Self {
+                    sequence: sequence & 127,
+                    files: vec![Source {
+                        name: format!("Clipboard-{nonce:016x}.{extension}"),
+                        size: image.bytes.len() as u64,
+                        data: SourceData::Image(image.bytes),
+                        code,
+                        mime,
+                    }],
+                })
+            }
+            _ => anyhow::bail!("Clipboard is not a file or image"),
+        }
+    }
     pub fn open(paths: Vec<PathBuf>, sequence: u8) -> anyhow::Result<Self> {
         anyhow::ensure!(
             (1..=128).contains(&paths.len()),
@@ -105,10 +133,9 @@ impl Offer {
             );
             let (code, mime) = file_type(name);
             files.push(Source {
-                file,
+                data: SourceData::File(file, stamp),
                 name: name.into(),
                 size,
-                fingerprint: stamp,
                 code,
                 mime,
             });
@@ -131,21 +158,28 @@ impl Offer {
             .files
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("Unknown clipboard item"))?;
-        anyhow::ensure!(
-            fingerprint(&file.file)? == file.fingerprint,
-            "Copied file changed; copy it again"
-        );
+        if let SourceData::File(source, stamp) = &file.data {
+            anyhow::ensure!(
+                fingerprint(source)? == *stamp,
+                "Copied file changed; copy it again"
+            );
+        }
         Ok(file)
     }
     pub fn read(&self, index: usize, offset: u64) -> anyhow::Result<Vec<u8>> {
         let source = self.check(index)?;
         anyhow::ensure!(offset <= source.size, "Invalid clipboard offset");
+        let file = match &source.data {
+            SourceData::Image(bytes) => {
+                let start = offset as usize;
+                return Ok(bytes[start..bytes.len().min(start + 16384)].to_vec());
+            }
+            SourceData::File(file, _) => file,
+        };
         let mut bytes = vec![0; (source.size - offset).min(16384) as usize];
         let mut filled = 0;
         while filled < bytes.len() {
-            let count = source
-                .file
-                .read_at(&mut bytes[filled..], offset + filled as u64)?;
+            let count = file.read_at(&mut bytes[filled..], offset + filled as u64)?;
             anyhow::ensure!(count != 0, "Copied file truncated");
             filled += count;
         }
@@ -245,6 +279,41 @@ fn data<'a>(fields: &[Field<'a>], id: u32) -> anyhow::Result<&'a [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_snapshot_serves_exact_bytes_in_chunks_and_rejects_stale_requests() {
+        let bytes: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+        let offer = Offer::from_content(
+            crate::clipboard::Content::Image(crate::clipboard::Image {
+                name: "Clipboard.png",
+                bytes: bytes.clone(),
+            }),
+            9,
+        )
+        .unwrap();
+        assert_eq!(offer.check(0).unwrap().mime, "image/png");
+        assert_eq!(offer.check(0).unwrap().size, bytes.len() as u64);
+        let mut received = Vec::new();
+        while received.len() < bytes.len() {
+            received.extend(offer.read(0, received.len() as u64).unwrap());
+        }
+        assert_eq!(received, bytes);
+        assert!(offer.read(0, 40_000).unwrap().is_empty());
+        assert!(offer.read(0, 40_001).is_err());
+        assert!(offer.read(1, 0).is_err());
+        let mut request = wire::integer(1, 4);
+        request.extend(wire::message(6, &wire::integer(1, 8)));
+        assert!(offer.reply(&request).is_err());
+        assert!(
+            Offer::from_content(
+                crate::clipboard::Content::Image(crate::clipboard::Image {
+                    name: "Clipboard.png",
+                    bytes: vec![],
+                }),
+                1
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn only_copied_pinned_unchanged_files_can_be_requested() {
         let root = std::env::temp_dir().join(format!(

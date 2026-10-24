@@ -360,9 +360,7 @@ pub(crate) fn sdk_event_value(packet: &Node<'_>) -> anyhow::Result<(u32, u32)> {
 }
 pub(crate) fn sdk_data(id: u32, offset: i64, data: &[u8]) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
-        id > 0
-            && data.len() <= 16384
-            && ((offset >= 0 && !data.is_empty()) || (offset == -1 && data.is_empty())),
+        id > 0 && data.len() <= 16384 && offset >= 0,
         "Invalid clipboard data chunk"
     );
     let mut fields = tlv(3, 0, &id.to_be_bytes())?;
@@ -455,7 +453,15 @@ mod tests {
                 "0101ffff0000003d00030100000300000033000300000000000400000007000400010000000800000000000000090003000200000004000000030005000300000003616263"
             )
         );
-        assert!(super::sdk_data(7, 0, &[]).is_err());
+        // Native ContinueSend's successful EOF carries the final byte offset
+        // and an empty payload. Negative offsets mean cancellation/failure.
+        assert_eq!(
+            super::sdk_data(7, 12, &[]).unwrap(),
+            decode(
+                "0101ffff0000003a000301000003000000300003000000000004000000070004000100000008000000000000000c0003000200000004000000000005000300000000"
+            )
+        );
+        assert!(super::sdk_data(7, -1, &[]).is_err());
         assert!(super::sdk_data(7, -1, b"abc").is_err());
         assert!(super::sdk_data(7, 0, &vec![0; 16385]).is_err());
         let mut bad = event;
