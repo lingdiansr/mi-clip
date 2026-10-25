@@ -125,6 +125,39 @@ pub(crate) fn open(key: &[u8; 16], record: &[u8]) -> anyhow::Result<Chunk> {
     })
 }
 
+/// Encode a bounded file record; Android must still acknowledge task completion.
+pub(crate) fn seal(
+    key: &[u8; 16],
+    stream: u32,
+    offset: u64,
+    data: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use crate::file_transport::{tlv, union};
+    anyhow::ensure!(
+        data.len() <= 2 * 1024 * 1024,
+        "Oversized outgoing file record"
+    );
+    let mut fields = tlv(5, 0, &[])?;
+    fields.extend(tlv(3, 1, &stream.to_be_bytes())?);
+    fields.extend(tlv(4, 2, &offset.to_be_bytes())?);
+    fields.extend(tlv(3, 3, &(data.len() as u32).to_be_bytes())?);
+    let footer = union(256, 256, &fields)?;
+    let mut plain = data.to_vec();
+    plain.extend(&footer);
+    plain.extend((footer.len() as u16).to_be_bytes());
+    let nonce = crate::private::random::<12>()?;
+    let sealed = Aes128Gcm::new_from_slice(key)
+        .unwrap()
+        .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
+        .map_err(|_| anyhow::anyhow!("File encryption failed"))?;
+    let mut record = vec![0; 6];
+    record.extend(((sealed.len() + 12) as u32).to_be_bytes());
+    record.extend(nonce);
+    record.extend(&sealed[sealed.len() - 16..]);
+    record.extend(&sealed[..sealed.len() - 16]);
+    Ok(record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

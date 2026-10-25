@@ -936,6 +936,15 @@ pub(crate) fn incoming(
     key: &[u8; 32],
     peer: &VerifyingKey,
 ) -> anyhow::Result<Option<Incoming>> {
+    incoming_to(logical, key, peer, 0)
+}
+
+pub(crate) fn incoming_to(
+    logical: &[u8],
+    key: &[u8; 32],
+    peer: &VerifyingKey,
+    destination: u8,
+) -> anyhow::Result<Option<Incoming>> {
     if number(logical, 4).unwrap_or(0) != 0 {
         return Ok(None);
     }
@@ -956,7 +965,7 @@ pub(crate) fn incoming(
     };
     anyhow::ensure!(logical.len() <= 4096, "Oversized file-channel request");
     anyhow::ensure!(
-        number(logical, 2).unwrap_or(0) == 0,
+        number(logical, 2).unwrap_or(0) == u64::from(destination),
         "Unexpected file-channel destination"
     );
     let peer_id = u8::try_from(number(logical, 1).unwrap_or(0))?;

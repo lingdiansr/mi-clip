@@ -25,3 +25,8 @@
 !/tools/prepare-release.py
 !/tests/
 !/tests/*.py
+
+!/macos/
+!/macos/*.swift
+!/macos/*.entitlements
+!/tools/build-app.sh

@@ -170,7 +170,7 @@ pub(crate) fn frame(input: &[u8]) -> anyhow::Result<Node<'_>> {
     Ok(branches.remove(0))
 }
 
-fn union(tag: u16, kind: u16, value: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn union(tag: u16, kind: u16, value: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut body = tag.to_be_bytes().to_vec();
     body.extend(tlv(kind, tag, value)?);
     tlv(0x101, u16::MAX, &body)

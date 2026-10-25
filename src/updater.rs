@@ -154,6 +154,12 @@ pub enum Check {
     Ready(PendingUpdate),
 }
 
+pub fn bundled() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|path| path.parent().is_some_and(|p| p.ends_with("Contents/MacOS")))
+}
+
 pub fn check() -> anyhow::Result<Check> {
     check_with_progress(|_| {})
 }
@@ -228,6 +234,10 @@ pub fn mark_ready() -> anyhow::Result<()> {
 /// Preserve the old inode until the replacement reports a functioning status bar.
 pub fn install(pending: PendingUpdate, arguments: &[String]) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
+    anyhow::ensure!(
+        !bundled(),
+        "Replace the complete Clip.app to update its signed extension"
+    );
     let backup = health_file(&pending.executable)?.with_extension("previous");
     let ready = health_file(&pending.executable)?;
     let result = (|| -> anyhow::Result<()> {

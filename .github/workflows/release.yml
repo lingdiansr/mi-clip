@@ -93,6 +93,8 @@ jobs:
         run: cargo test --locked --no-default-features --features research --lib
       - name: Build optimized binary
         run: sh tools/build-release.sh --bin mi-clip
+      - name: Build native macOS Share extension and app bundle
+        run: MI_CLIP_SKIP_BUILD=1 sh tools/build-app.sh
       - name: Validate UI scripts and synthetic peer
         run: |
           target/release/mi-clip --check-ui
@@ -134,6 +136,10 @@ jobs:
             "release-assets/manifest-macos-${RELEASE_ARCH}.json" \
             "release-assets/mi-clip-macos-${RELEASE_ARCH}"
           (cd release-assets && shasum -a 256 "mi-clip-macos-${RELEASE_ARCH}" > "mi-clip-macos-${RELEASE_ARCH}.sha256")
+      - name: Package app with Clip sharing
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent target/app/Clip.app "release-assets/Clip-macos-${RELEASE_ARCH}.zip"
+          (cd release-assets && shasum -a 256 "Clip-macos-${RELEASE_ARCH}.zip" > "Clip-macos-${RELEASE_ARCH}.zip.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}
@@ -163,6 +169,8 @@ jobs:
             test -s "release-assets/mi-clip-macos-${arch}"
             test -s "release-assets/manifest-macos-${arch}.json"
             (cd release-assets && sha256sum -c "mi-clip-macos-${arch}.sha256")
+            test -s "release-assets/Clip-macos-${arch}.zip"
+            (cd release-assets && sha256sum -c "Clip-macos-${arch}.zip.sha256")
           done
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "Mi Clip $RELEASE_TAG" --draft

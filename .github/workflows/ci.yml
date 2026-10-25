@@ -49,3 +49,5 @@ jobs:
       - name: Warm optimized release dependencies
         # Preserve the release script's encoded path-remapping Rust flags.
         run: sh tools/build-release.sh --bin mi-clip
+      - name: Validate native share app packaging
+        run: MI_CLIP_SKIP_BUILD=1 sh tools/build-app.sh

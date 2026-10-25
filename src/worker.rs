@@ -59,6 +59,15 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                     SyncEvent::FileClipboardFailed => {
                         ("已连接", "文件取用失败 · 请重新复制后粘贴".into())
                     }
+                    SyncEvent::ShareStarted => {
+                        ("已连接", "正在向手机发起文件分享 · 请在手机确认接收".into())
+                    }
+                    SyncEvent::ShareCompleted(files) => {
+                        ("已连接", format!("手机已确认接收 {files} 个文件"))
+                    }
+                    SyncEvent::ShareFailed => {
+                        ("已连接", "文件分享失败 · 请查看共享窗口后重试".into())
+                    }
                     SyncEvent::UnsupportedClipboard => {
                         ("已连接", "手机复制的此类内容暂不支持".into())
                     }

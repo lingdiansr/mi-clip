@@ -8,7 +8,10 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -123,7 +126,6 @@ fn networking_probe(
     }
     // The networking registry separately checks proof of account membership.
     // Sign a fresh challenge with our enrolled key, never a vendor-owned key.
-    use base64::engine::general_purpose::STANDARD;
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use x509_cert::der::{DecodePem, Encode};
     let certificate_path = Path::new(&config.identity)
@@ -221,7 +223,6 @@ fn client_finished(
     reply: &[u8],
     info: &[u8],
 ) -> anyhow::Result<(Vec<u8>, p256::ecdsa::VerifyingKey)> {
-    use base64::engine::general_purpose::STANDARD;
     use p256::ecdsa::{Signature, SigningKey, signature::Signer};
     use x509_cert::der::{DecodePem, Encode};
     let notify = nested(reply, &[2, 1, 5, 7, 2, 6, 3])?;
@@ -560,6 +561,9 @@ pub enum SyncEvent {
     FileClipboardSent(u32),
     FileClipboardFailed,
     UnsupportedClipboard,
+    ShareStarted,
+    ShareCompleted(u32),
+    ShareFailed,
     File(crate::file_feedback::Event),
 }
 
@@ -713,6 +717,10 @@ fn exchange(
     #[cfg(feature = "file-sharing")]
     let mut port_probe: Option<crate::file_channel::FileReceiver> = None;
     #[cfg(feature = "file-sharing")]
+    let mut outgoing: Option<crate::share_sender::Sender> = None;
+    #[cfg(feature = "file-sharing")]
+    let mut share_scan = Instant::now();
+    #[cfg(feature = "file-sharing")]
     let mut clipboard_offer: Option<std::sync::Arc<crate::clipboard_files::Offer>> = None;
     anyhow::ensure!(
         !config.clipboard_sync || cfg!(feature = "clipboard"),
@@ -740,6 +748,66 @@ fn exchange(
     #[cfg(feature = "clipboard")]
     let mut initial_clipboard = true;
     while Instant::now() < deadline {
+        #[cfg(feature = "file-sharing")]
+        {
+            if let Some(sender) = outgoing.as_mut() {
+                match sender.poll() {
+                    Ok(true) => {
+                        on_event(SyncEvent::ShareCompleted(
+                            sender.request.offer.files.len() as u32
+                        ));
+                        outgoing = None;
+                        file_connection = None;
+                        file_service = None;
+                        file_notice = None;
+                    }
+                    Err(error) => {
+                        diagnostic!("Outgoing share failed: {error:#}");
+                        on_event(SyncEvent::ShareFailed);
+                        outgoing = None;
+                        file_connection = None;
+                        file_service = None;
+                        file_notice = None;
+                    }
+                    Ok(false) => (),
+                }
+            }
+            if stop.is_some()
+                && network_ready
+                && outgoing.is_none()
+                && file_connection.is_none()
+                && share_scan.elapsed() >= Duration::from_millis(500)
+            {
+                share_scan = Instant::now();
+                if let Some(root) = crate::share_queue::root() {
+                    match crate::share_queue::Request::next(&root) {
+                        Ok(Some(request)) => {
+                            let sender = crate::share_sender::Sender::new(request)?;
+                            let signing = p256::ecdsa::SigningKey::from_slice(
+                                &base64::engine::general_purpose::STANDARD
+                                    .decode(&identity.private_key)?,
+                            )?;
+                            let inner = crate::file_channel::sync_reply_for_service(
+                                active_key.as_ref().unwrap(),
+                                &signing,
+                                &session.user_id,
+                                crate::file_channel::SHARE_SERVICE,
+                            )?;
+                            let mut logical = integer(1, 2);
+                            logical.extend(integer(3, sender.nonce.into()));
+                            logical.extend(message(5, &inner));
+                            transport.send(&frame(17, &message(2, &message(1, &logical)))?)?;
+                            outgoing = Some(sender);
+                            on_event(SyncEvent::ShareStarted);
+                        }
+                        Err(error) => {
+                            diagnostic!("Share queue rejected: {error:#}");
+                        }
+                        Ok(None) => (),
+                    }
+                }
+            }
+        }
         #[cfg(feature = "file-sharing")]
         if let Some(probe) = port_probe.as_mut() {
             let result = probe.poll();
@@ -868,7 +936,8 @@ fn exchange(
         }
         let tick = Duration::from_millis(250);
         #[cfg(feature = "file-sharing")]
-        let tick = if port_probe.as_ref().is_some_and(|probe| probe.running()) {
+        let tick = if outgoing.is_some() || port_probe.as_ref().is_some_and(|probe| probe.running())
+        {
             Duration::from_millis(20)
         } else {
             tick
@@ -936,6 +1005,32 @@ fn exchange(
         if let (Some(session_key), Ok(logical)) =
             (active_key.as_ref(), nested(&reply[4..], &[2, 1]))
         {
+            #[cfg(feature = "file-sharing")]
+            if let (Some(sender), Some(peer)) = (outgoing.as_mut(), peer_key.as_ref()) {
+                if number(logical, 2).unwrap_or(0) == 2
+                    && number(logical, 4).unwrap_or(0) == 0
+                    && number(logical, 3).unwrap_or(0) == u64::from(sender.nonce)
+                    && let Some(incoming) =
+                        crate::file_channel::incoming_to(logical, session_key, peer, 2)?
+                {
+                    anyhow::ensure!(
+                        incoming.service == crate::file_channel::SHARE_SERVICE
+                            && sender.peer.is_none(),
+                        "Unexpected share proof"
+                    );
+                    sender.peer = Some(incoming.peer_id);
+                    file_connection = Some((incoming.peer_id, incoming.nonce));
+                    file_service = Some(crate::file_channel::SHARE_SERVICE);
+                    transport.send(&logical_packet(
+                        2,
+                        incoming.peer_id.into(),
+                        incoming.nonce.into(),
+                        session_key,
+                        &sender.logical_request(),
+                    )?)?;
+                    continue;
+                }
+            }
             if file_advertised {
                 if let Some(peer) = peer_key.as_ref() {
                     // Invalid file proofs must not interrupt clipboard sync or
@@ -946,6 +1041,10 @@ fn exchange(
                         Err(_) => None,
                     };
                     if let Some(incoming) = incoming {
+                        #[cfg(feature = "file-sharing")]
+                        if outgoing.is_some() {
+                            continue;
+                        }
                         let is_clipboard = crate::file_channel::clipboard_service(incoming.service);
                         #[cfg(feature = "file-sharing")]
                         if is_clipboard && clipboard_offer.is_none() {
@@ -977,9 +1076,9 @@ fn exchange(
                         if !files_enabled {
                             continue;
                         }
-                        use base64::engine::general_purpose::STANDARD;
                         let signing = p256::ecdsa::SigningKey::from_slice(
-                            &STANDARD.decode(&identity.private_key)?,
+                            &base64::engine::general_purpose::STANDARD
+                                .decode(&identity.private_key)?,
                         )?;
                         let inner = crate::file_channel::sync_reply_for_service(
                             session_key,
@@ -1019,6 +1118,10 @@ fn exchange(
                     diagnostic!(
                         "Peer closed file logical connection: code {code}; ready for a new request."
                     );
+                    #[cfg(feature = "file-sharing")]
+                    if outgoing.take().is_some() {
+                        on_event(SyncEvent::ShareFailed);
+                    }
                     file_connection = None;
                     file_port_binding = None;
                     file_notice = None;
@@ -1064,6 +1167,25 @@ fn exchange(
                             )),
                         "Unexpected file-channel connection identity"
                     );
+                    #[cfg(feature = "file-sharing")]
+                    if let Some(sender) = outgoing.as_mut() {
+                        anyhow::ensure!(
+                            number(&plaintext, 1)? == 2,
+                            "Unexpected share logical response"
+                        );
+                        let response = nested(&plaintext, &[3])?;
+                        anyhow::ensure!(
+                            number(response, 1).unwrap_or(0) == 0,
+                            "Phone rejected share connection"
+                        );
+                        let mut ack = integer(1, 3);
+                        ack.extend(message(4, &[]));
+                        transport.send(&logical_encrypted(&reply[4..], session_key, &ack)?)?;
+                        let mut payload = vec![sender.peer.unwrap(), 0];
+                        payload.extend(sender.port_request()?);
+                        transport.send(&frame(0x29, &payload)?)?;
+                        continue;
+                    }
                     if number(&plaintext, 1)? == 1 {
                         let request = nested(&plaintext, &[2])?;
                         anyhow::ensure!(
@@ -1141,6 +1263,11 @@ fn exchange(
                                 control.message_id,
                                 control.body.len()
                             );
+                            #[cfg(feature = "file-sharing")]
+                            if let Some(sender) = outgoing.as_mut() {
+                                sender.connect(&control, config.endpoint)?;
+                                continue;
+                            }
                             #[cfg(feature = "file-sharing")]
                             if control.kind == 2 {
                                 let request = crate::file_channel::port_request(&control)?;

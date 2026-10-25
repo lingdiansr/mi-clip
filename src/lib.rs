@@ -24,6 +24,10 @@ pub mod networking;
 #[cfg(feature = "research")]
 mod notifications;
 mod private;
+#[cfg(feature = "file-sharing")]
+mod share_queue;
+#[cfg(feature = "file-sharing")]
+mod share_sender;
 pub mod transport;
 mod update_key;
 pub mod updater;
