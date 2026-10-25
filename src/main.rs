@@ -2,6 +2,7 @@
 mod devices;
 mod notifications;
 mod probe;
+mod sharing_setup;
 mod tray;
 mod ui;
 mod update_ui;
@@ -76,6 +77,9 @@ fn main() -> anyhow::Result<()> {
     if argument.is_some() && !smoke {
         anyhow::bail!("Unknown argument; use --help");
     }
+    // An installed app must register its extension even when an older
+    // standalone client already owns the clipboard lock.
+    let share_setup = if smoke { None } else { sharing_setup::start() };
     // Hold an OS lock for this process's lifetime; no PID or clipboard data stored.
     let _instance = if !smoke {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -95,6 +99,9 @@ fn main() -> anyhow::Result<()> {
             .mode(0o600)
             .open(directory.join("instance.lock"))?;
         if file.try_lock().is_err() {
+            if let Some(setup) = share_setup {
+                let _ = setup.join();
+            }
             return Ok(());
         }
         Some(file)

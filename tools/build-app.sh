@@ -10,7 +10,7 @@ export MACOSX_DEPLOYMENT_TARGET
 miclip_app=${MI_CLIP_APP_OUTPUT:-target/app/Clip.app}
 miclip_extension="$miclip_app/Contents/PlugIns/ClipShare.appex"
 mkdir -p "$miclip_app/Contents/MacOS" "$miclip_extension/Contents/MacOS"
-cp target/release/mi-clip "$miclip_app/Contents/MacOS/mi-clip"
+cp "${MI_CLIP_APP_BINARY:-target/release/mi-clip}" "$miclip_app/Contents/MacOS/mi-clip"
 python3 - "$miclip_app" <<'PY'
 import plistlib, sys, re
 from pathlib import Path

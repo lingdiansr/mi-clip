@@ -15,7 +15,7 @@ use std::{
 
 pub const REPOSITORY: &str = match option_env!("MI_CLIP_UPDATE_REPOSITORY") {
     Some(v) => v,
-    None => "",
+    None => "mnhkahn/mi-clip",
 };
 const MAX_BINARY: usize = 64 * 1024 * 1024;
 

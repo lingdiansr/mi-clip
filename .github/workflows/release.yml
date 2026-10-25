@@ -95,6 +95,8 @@ jobs:
         run: sh tools/build-release.sh --bin mi-clip
       - name: Build native macOS Share extension and app bundle
         run: MI_CLIP_SKIP_BUILD=1 sh tools/build-app.sh
+      - name: Verify first-launch Share extension registration
+        run: python3 tests/share_registration_test.py target/app/Clip.app
       - name: Validate UI scripts and synthetic peer
         run: |
           target/release/mi-clip --check-ui

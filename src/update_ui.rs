@@ -69,7 +69,10 @@ fn start_worker(
                 Ok(Check::Current) => Notice::Current,
                 Ok(Check::Unpublished) => Notice::Unpublished,
                 Ok(Check::Ready(pending)) => Notice::Ready(pending),
-                Err(_) => Notice::Failed,
+                Err(error) => {
+                    eprintln!("Mi Clip update check failed: {error:#}");
+                    Notice::Failed
+                }
             };
             // A fast response must not replace Checking before the next painted frame.
             std::thread::sleep(Duration::from_millis(1500).saturating_sub(started.elapsed()));

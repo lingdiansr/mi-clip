@@ -63,7 +63,10 @@ fn content_height(detail: &str) -> f32 {
 }
 pub const PANEL_WIDTH: f32 = 280.0;
 pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels> {
-    gpui_rhai::gpui::size(px(PANEL_WIDTH), px(content_height(detail) + 40.0 + 232.0))
+    gpui_rhai::gpui::size(
+        px(PANEL_WIDTH),
+        px(content_height(detail) + 40.0 + 28.0 + 232.0),
+    )
 }
 
 pub struct Panel {
@@ -335,6 +338,18 @@ impl Render for Panel {
                                 .on_click(|_, _, cx| cx.quit())
                                 .child("退出"),
                         ),
+                )
+                .child(
+                    div()
+                        .id("share-setup")
+                        .h(px(28.0))
+                        .flex_shrink_0()
+                        .px(px(14.0))
+                        .text_size(px(10.0))
+                        .text_color(rgba(0xa4acbaff))
+                        .cursor_pointer()
+                        .on_click(|_, _, _| crate::sharing_setup::open_help())
+                        .child(crate::sharing_setup::hint()),
                 )
                 .child(
                     div()
