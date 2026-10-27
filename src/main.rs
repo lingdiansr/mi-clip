@@ -140,8 +140,8 @@ fn main() -> anyhow::Result<()> {
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Some(update) = quitting.update.lock().unwrap().take() {
-                        if mi_clip::updater::install(update, &update_args).is_err() {
-                            eprintln!("Update failed; previous version restored.");
+                        if let Err(error) = mi_clip::updater::install(update, &update_args) {
+                            eprintln!("Mi Clip update installation failed: {error:#}");
                         }
                     }
                 }

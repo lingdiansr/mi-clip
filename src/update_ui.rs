@@ -12,7 +12,6 @@ use std::{
 
 pub enum Notice {
     Checking,
-    AppBundle,
     Downloading(String),
     Current,
     Unpublished,
@@ -21,11 +20,6 @@ pub enum Notice {
 }
 
 pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSender<()> {
-    if updater::bundled() {
-        let (request, _receive) = mpsc::sync_channel(1);
-        let _ = events.try_send(TrayEvent::Update(Notice::AppBundle));
-        return request;
-    }
     start_worker(events, stop, Duration::from_secs(10), |progress| {
         updater::check_with_progress(progress)
     })

@@ -1,4 +1,6 @@
-//! Signed, bounded single-binary updates. No updater framework or unsigned fallback.
+//! Signed, bounded application and legacy executable updates.
+#[path = "update_bundle.rs"]
+mod bundle;
 use crate::{http, private, update_key};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use p256::ecdsa::{
@@ -18,6 +20,39 @@ pub const REPOSITORY: &str = match option_env!("MI_CLIP_UPDATE_REPOSITORY") {
     None => "mnhkahn/mi-clip",
 };
 const MAX_BINARY: usize = 64 * 1024 * 1024;
+const MAX_APP: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Artifact {
+    #[default]
+    Binary,
+    AppZip,
+}
+impl Artifact {
+    fn is_binary(&self) -> bool {
+        *self == Self::Binary
+    }
+    fn limit(self) -> usize {
+        if self == Self::Binary {
+            MAX_BINARY
+        } else {
+            MAX_APP
+        }
+    }
+    fn manifest(self, arch: &str) -> String {
+        match self {
+            Self::Binary => format!("manifest-macos-{arch}.json"),
+            Self::AppZip => format!("manifest-app-macos-{arch}.json"),
+        }
+    }
+    fn asset(self, arch: &str) -> String {
+        match self {
+            Self::Binary => asset(arch),
+            Self::AppZip => format!("Clip-macos-{arch}.zip"),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +64,8 @@ struct Envelope {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Release {
+    #[serde(default, skip_serializing_if = "Artifact::is_binary")]
+    kind: Artifact,
     version: String,
     arch: String,
     size: usize,
@@ -70,7 +107,7 @@ fn release_url(repo: &str, release: &Release) -> String {
     format!(
         "https://github.com/{repo}/releases/download/v{}/{}",
         release.version,
-        asset(&release.arch)
+        release.kind.asset(&release.arch)
     )
 }
 fn verify_feed(
@@ -95,7 +132,7 @@ fn verify_feed(
         "Update architecture mismatch"
     );
     anyhow::ensure!(
-        (32..=MAX_BINARY).contains(&release.size)
+        (32..=release.kind.limit()).contains(&release.size)
             && release.sha256.len() == 64
             && release.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
         "Invalid update size or digest"
@@ -108,7 +145,15 @@ fn verify_feed(
 }
 fn verify_binary(bytes: &[u8], release: &Release) -> anyhow::Result<()> {
     anyhow::ensure!(
-        bytes.len() == release.size && bytes.len() <= MAX_BINARY,
+        release.kind == Artifact::Binary,
+        "Expected an executable update"
+    );
+    verify_digest(bytes, release)?;
+    verify_macho(bytes, &release.arch)
+}
+fn verify_digest(bytes: &[u8], release: &Release) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes.len() == release.size && bytes.len() <= release.kind.limit(),
         "Update length mismatch"
     );
     let digest: String = Sha256::digest(bytes)
@@ -116,7 +161,10 @@ fn verify_binary(bytes: &[u8], release: &Release) -> anyhow::Result<()> {
         .map(|v| format!("{v:02x}"))
         .collect();
     anyhow::ensure!(digest == release.sha256, "Update digest mismatch");
-    let cpu = match release.arch.as_str() {
+    Ok(())
+}
+fn verify_macho(bytes: &[u8], arch: &str) -> anyhow::Result<()> {
+    let cpu = match arch {
         "x86_64" => 0x01000007u32,
         "aarch64" => 0x0100000c,
         _ => anyhow::bail!("Unsupported update architecture"),
@@ -140,12 +188,21 @@ impl PendingUpdate {
         &self.release.version
     }
     pub fn validate(&self) -> anyhow::Result<()> {
-        verify_binary(&fs::read(&self.staged)?, &self.release)
+        let bytes = fs::read(&self.staged)?;
+        match self.release.kind {
+            Artifact::Binary => verify_binary(&bytes, &self.release),
+            Artifact::AppZip => bundle::verify_archive(&bytes, &self.release),
+        }
     }
 }
 impl Drop for PendingUpdate {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.staged);
+        match self.release.kind {
+            Artifact::Binary => {
+                let _ = fs::remove_file(&self.staged);
+            }
+            Artifact::AppZip => bundle::cleanup(&self.staged),
+        }
     }
 }
 pub enum Check {
@@ -157,7 +214,7 @@ pub enum Check {
 pub fn bundled() -> bool {
     std::env::current_exe()
         .ok()
-        .is_some_and(|path| path.parent().is_some_and(|p| p.ends_with("Contents/MacOS")))
+        .is_some_and(|path| bundle::app_root(&path).is_some())
 }
 
 pub fn check() -> anyhow::Result<Check> {
@@ -167,24 +224,60 @@ pub fn check() -> anyhow::Result<Check> {
 pub fn check_with_progress(mut downloading: impl FnMut(&str)) -> anyhow::Result<Check> {
     anyhow::ensure!(repository(REPOSITORY), "Update repository not configured");
     let arch = std::env::consts::ARCH;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let kind = if bundle::app_root(&executable).is_some() {
+        Artifact::AppZip
+    } else {
+        Artifact::Binary
+    };
     let url = format!(
-        "https://github.com/{REPOSITORY}/releases/latest/download/manifest-macos-{arch}.json"
+        "https://github.com/{REPOSITORY}/releases/latest/download/{}",
+        kind.manifest(arch)
     );
     let response = http::download(&url, 65536)?;
     if response.status == 404 {
+        // Old releases only have executable manifests. They can establish
+        // "current", but can never authorize an unsigned application archive.
+        if kind == Artifact::AppZip {
+            let legacy = http::download(
+                &format!(
+                    "https://github.com/{REPOSITORY}/releases/latest/download/{}",
+                    Artifact::Binary.manifest(arch)
+                ),
+                65536,
+            )?;
+            if legacy.status == 200 {
+                let key = VerifyingKey::from_sec1_bytes(&STANDARD.decode(update_key::PUBLIC_KEY)?)?;
+                let release = verify_feed(&legacy.body, &key, REPOSITORY, arch)?;
+                anyhow::ensure!(release.kind == Artifact::Binary, "Wrong legacy update type");
+                if version(&release.version)? <= version(env!("CARGO_PKG_VERSION"))? {
+                    return Ok(Check::Current);
+                }
+            } else {
+                anyhow::ensure!(legacy.status == 404, "Legacy update feed request failed");
+            }
+        }
         return Ok(Check::Unpublished);
     }
     anyhow::ensure!(response.status == 200, "Update feed request failed");
     let key = VerifyingKey::from_sec1_bytes(&STANDARD.decode(update_key::PUBLIC_KEY)?)?;
     let release = verify_feed(&response.body, &key, REPOSITORY, arch)?;
+    anyhow::ensure!(release.kind == kind, "Update artifact type mismatch");
     if version(&release.version)? <= version(env!("CARGO_PKG_VERSION"))? {
         return Ok(Check::Current);
     }
     downloading(&release.version);
     let response = http::download(&release.url, release.size)?;
     anyhow::ensure!(response.status == 200, "Update download failed");
+    if kind == Artifact::AppZip {
+        let staged = bundle::prepare(&response.body, &release, &executable)?;
+        return Ok(Check::Ready(PendingUpdate {
+            release,
+            staged,
+            executable,
+        }));
+    }
     verify_binary(&response.body, &release)?;
-    let executable = std::env::current_exe()?.canonicalize()?;
     let parent = executable
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Executable directory unavailable"))?;
@@ -206,8 +299,10 @@ fn health_file(executable: &Path) -> anyhow::Result<PathBuf> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    Ok(executable
-        .parent()
+    let parent = bundle::app_root(executable)
+        .and_then(|p| p.parent())
+        .or_else(|| executable.parent());
+    Ok(parent
         .ok_or_else(|| anyhow::anyhow!("Missing executable directory"))?
         .join(format!(".mi-clip-health-{nonce}")))
 }
@@ -219,7 +314,10 @@ pub fn mark_ready() -> anyhow::Result<()> {
     let executable = std::env::current_exe()?.canonicalize()?;
     let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
     anyhow::ensure!(
-        path.parent() == executable.parent()
+        path.parent()
+            == bundle::app_root(&executable)
+                .and_then(|p| p.parent())
+                .or_else(|| executable.parent())
             && name.starts_with(".mi-clip-health-")
             && name.len() == ".mi-clip-health-".len() + 32
             && name[".mi-clip-health-".len()..]
@@ -234,9 +332,12 @@ pub fn mark_ready() -> anyhow::Result<()> {
 /// Preserve the old inode until the replacement reports a functioning status bar.
 pub fn install(pending: PendingUpdate, arguments: &[String]) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
+    if pending.release.kind == Artifact::AppZip {
+        return bundle::install(&pending, arguments);
+    }
     anyhow::ensure!(
-        !bundled(),
-        "Replace the complete Clip.app to update its signed extension"
+        bundle::app_root(&pending.executable).is_none(),
+        "Executable updates cannot modify an application bundle"
     );
     let backup = health_file(&pending.executable)?.with_extension("previous");
     let ready = health_file(&pending.executable)?;
@@ -297,6 +398,8 @@ pub fn sign_release(config: &Path, output: &Path) -> anyhow::Result<()> {
         repository: String,
         binary: PathBuf,
         private_key: PathBuf,
+        #[serde(default)]
+        app_archive: Option<PathBuf>,
     }
     let config: Config = serde_json::from_slice(&fs::read(config)?)?;
     version(&config.version)?;
@@ -307,39 +410,47 @@ pub fn sign_release(config: &Path, output: &Path) -> anyhow::Result<()> {
             == STANDARD.decode(update_key::PUBLIC_KEY)?,
         "Signing key does not match this project's public key"
     );
-    let bytes = fs::read(config.binary)?;
-    let mut release = Release {
-        version: config.version,
-        arch: config.arch,
-        size: bytes.len(),
-        sha256: Sha256::digest(&bytes)
-            .iter()
-            .map(|v| format!("{v:02x}"))
-            .collect(),
-        url: String::new(),
-    };
-    release.url = release_url(&config.repository, &release);
-    verify_binary(&bytes, &release)?;
-    let payload = serde_json::to_vec(&release)?;
-    let signature: Signature = signing.sign(&payload);
-    let envelope = Envelope {
-        payload: STANDARD.encode(&payload),
-        signature: STANDARD.encode(signature.to_der().as_bytes()),
-    };
-    let manifest = serde_json::to_vec(&envelope)?;
-    verify_feed(
-        &manifest,
-        signing.verifying_key(),
-        &config.repository,
-        &release.arch,
-    )?;
-    let binary = output.join(asset(&release.arch));
-    private::save(&binary, &bytes)?;
-    fs::set_permissions(binary, fs::Permissions::from_mode(0o755))?;
-    private::save(
-        &output.join(format!("manifest-macos-{}.json", release.arch)),
-        &manifest,
-    )?;
+    let mut artifacts = vec![(Artifact::Binary, fs::read(&config.binary)?)];
+    if let Some(path) = config.app_archive {
+        artifacts.push((Artifact::AppZip, fs::read(path)?));
+    }
+    for (kind, bytes) in artifacts {
+        let mut release = Release {
+            kind,
+            version: config.version.clone(),
+            arch: config.arch.clone(),
+            size: bytes.len(),
+            sha256: Sha256::digest(&bytes)
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect(),
+            url: String::new(),
+        };
+        release.url = release_url(&config.repository, &release);
+        match kind {
+            Artifact::Binary => verify_binary(&bytes, &release)?,
+            Artifact::AppZip => bundle::verify_archive(&bytes, &release)?,
+        }
+        let payload = serde_json::to_vec(&release)?;
+        let signature: Signature = signing.sign(&payload);
+        let envelope = Envelope {
+            payload: STANDARD.encode(&payload),
+            signature: STANDARD.encode(signature.to_der().as_bytes()),
+        };
+        let manifest = serde_json::to_vec(&envelope)?;
+        verify_feed(
+            &manifest,
+            signing.verifying_key(),
+            &config.repository,
+            &release.arch,
+        )?;
+        let artifact = output.join(kind.asset(&release.arch));
+        private::save(&artifact, &bytes)?;
+        if kind == Artifact::Binary {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o755))?;
+        }
+        private::save(&output.join(kind.manifest(&release.arch)), &manifest)?;
+    }
     println!("Release artifact and signed manifest generated; private key not exported.");
     Ok(())
 }
@@ -354,6 +465,7 @@ mod tests {
         binary[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
         binary[12..16].copy_from_slice(&2u32.to_le_bytes());
         let mut release = Release {
+            kind: Artifact::Binary,
             version: "1.2.3".into(),
             arch: "x86_64".into(),
             size: binary.len(),
@@ -433,6 +545,38 @@ mod tests {
     }
 
     #[test]
+    fn signed_app_feed_binds_archive_type_url_and_digest_without_changing_legacy_feeds() {
+        let (key, mut release, binary) = fixture();
+        let legacy = serde_json::to_value(&release).unwrap();
+        assert!(legacy.get("kind").is_none());
+        release.kind = Artifact::AppZip;
+        release.url = release_url("example/clipboard", &release);
+        assert!(release.url.ends_with("/Clip-macos-x86_64.zip"));
+        let signed_app = signed(&key, &release);
+        let verified = verify_feed(
+            &signed_app,
+            key.verifying_key(),
+            "example/clipboard",
+            "x86_64",
+        )
+        .unwrap();
+        assert!(verified.kind == Artifact::AppZip);
+        assert!(verify_binary(&binary, &verified).is_err());
+        let mut envelope: Envelope = serde_json::from_slice(&signed_app).unwrap();
+        release.kind = Artifact::Binary;
+        envelope.payload = STANDARD.encode(serde_json::to_vec(&release).unwrap());
+        assert!(
+            verify_feed(
+                &serde_json::to_vec(&envelope).unwrap(),
+                key.verifying_key(),
+                "example/clipboard",
+                "x86_64"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn failed_launch_restores_original_executable() {
         let (_, release, bytes) = fixture();
         let root = std::env::temp_dir().join(format!(
@@ -480,6 +624,7 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         private::save(&staged, &binary).unwrap();
         let release = Release {
+            kind: Artifact::Binary,
             version: env!("CARGO_PKG_VERSION").into(),
             arch: std::env::consts::ARCH.into(),
             size: binary.len(),

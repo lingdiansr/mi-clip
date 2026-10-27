@@ -560,15 +560,6 @@ pub fn install(
                         return Ok(());
                     }
                     TrayEvent::CheckUpdate => {
-                        if !testing && mi_clip::updater::bundled() {
-                            update_text = "应用版更新请替换完整 Clip.app".into();
-                            if let Some(opened) = panel.as_ref() {
-                                let _ = opened.update(cx, |panel, _, cx| {
-                                    panel.update_label(&update_text, cx)
-                                });
-                            }
-                            return Ok(());
-                        }
                         if std::env::var_os("MICLIP_UPDATE_DIAGNOSTICS").is_some() {
                             eprintln!("Mi Clip update: manual request received");
                         }
@@ -597,7 +588,6 @@ pub fn install(
                     TrayEvent::Update(notice) => {
                         use crate::update_ui::Notice;
                         update_text = match notice {
-                            Notice::AppBundle => "应用版更新请替换完整 Clip.app".into(),
                             Notice::Checking => "检查中…".into(),
                             Notice::Downloading(version) => format!("正在下载 v{version}…"),
                             Notice::Current => ui::current_version_label(),

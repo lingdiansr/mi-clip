@@ -101,6 +101,17 @@ jobs:
         run: |
           target/release/mi-clip --check-ui
           python3 tests/probe_test.py target/release/mi-clip
+      - name: Package app with Clip sharing
+        run: |
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent target/app/Clip.app "release-assets/Clip-macos-${RELEASE_ARCH}.zip"
+          (cd release-assets && shasum -a 256 "Clip-macos-${RELEASE_ARCH}.zip" > "Clip-macos-${RELEASE_ARCH}.zip.sha256")
+      - name: Verify complete app update and extension tamper detection
+        run: |
+          MICLIP_TEST_BUNDLE_ZIP="$PWD/release-assets/Clip-macos-${RELEASE_ARCH}.zip" \
+          MICLIP_TEST_BUNDLE_VERSION="$RELEASE_VERSION" \
+          cargo test --locked --no-default-features --features research,analytics --lib \
+            updater::bundle::tests::real_signed_app_archive_preflight_and_extension_tamper_detection -- --ignored --exact
       - name: Sign and independently verify update assets
         env:
           MI_CLIP_SIGNING_KEY: ${{ secrets.MI_CLIP_SIGNING_KEY }}
@@ -128,6 +139,7 @@ jobs:
               'arch': os.environ['RELEASE_ARCH'],
               'repository': os.environ['MI_CLIP_UPDATE_REPOSITORY'],
               'binary': str(Path('target/release/mi-clip').resolve()),
+              'app_archive': str(Path(f"release-assets/Clip-macos-{os.environ['RELEASE_ARCH']}.zip").resolve()),
               'private_key': str(root / 'signing.key'),
           }
           (root / 'release.json').write_text(json.dumps(config))
@@ -137,11 +149,10 @@ jobs:
           python3 tests/update_signature_test.py \
             "release-assets/manifest-macos-${RELEASE_ARCH}.json" \
             "release-assets/mi-clip-macos-${RELEASE_ARCH}"
+          python3 tests/update_signature_test.py \
+            "release-assets/manifest-app-macos-${RELEASE_ARCH}.json" \
+            "release-assets/Clip-macos-${RELEASE_ARCH}.zip"
           (cd release-assets && shasum -a 256 "mi-clip-macos-${RELEASE_ARCH}" > "mi-clip-macos-${RELEASE_ARCH}.sha256")
-      - name: Package app with Clip sharing
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent target/app/Clip.app "release-assets/Clip-macos-${RELEASE_ARCH}.zip"
-          (cd release-assets && shasum -a 256 "Clip-macos-${RELEASE_ARCH}.zip" > "Clip-macos-${RELEASE_ARCH}.zip.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}
@@ -171,6 +182,7 @@ jobs:
             test -s "release-assets/mi-clip-macos-${arch}"
             test -s "release-assets/manifest-macos-${arch}.json"
             (cd release-assets && sha256sum -c "mi-clip-macos-${arch}.sha256")
+            test -s "release-assets/manifest-app-macos-${arch}.json"
             test -s "release-assets/Clip-macos-${arch}.zip"
             (cd release-assets && sha256sum -c "Clip-macos-${arch}.zip.sha256")
           done

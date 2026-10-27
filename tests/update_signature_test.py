@@ -1,4 +1,4 @@
-"""Independently verify a published manifest and executable using system OpenSSL."""
+"""Independently verify a published manifest and artifact using system OpenSSL."""
 import argparse
 import base64
 import hashlib
@@ -19,6 +19,7 @@ envelope = json.loads(args.manifest.read_bytes())
 payload = base64.b64decode(envelope["payload"], validate=True)
 signature = base64.b64decode(envelope["signature"], validate=True)
 release = json.loads(payload)
+assert release.get("kind", "binary") == ("app_zip" if args.binary.suffix == ".zip" else "binary")
 binary = args.binary.read_bytes()
 assert len(binary) == release["size"]
 assert hashlib.sha256(binary).hexdigest() == release["sha256"]
@@ -34,4 +35,4 @@ with tempfile.TemporaryDirectory(prefix="miclip-signature-") as directory:
     assert subprocess.run(command, capture_output=True).returncode == 0
     (root / "payload").write_bytes(payload + b" ")
     assert subprocess.run(command, capture_output=True).returncode != 0
-print("PASS: real release signature and executable digest; tampered manifest rejected")
+print("PASS: real release signature and artifact digest; tampered manifest rejected")

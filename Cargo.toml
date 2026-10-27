@@ -1,6 +1,6 @@
 [package]
 name = "mi-clip"
-version = "0.1.7"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -35,6 +35,7 @@ serde_json = "1"
 url = "2.5"
 qrcode = { version = "0.14", default-features = false }
 png = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 gpui-rhai = { version = "=0.2.2", default-features = false, optional = true }
 block2 = { version = "0.6.2", optional = true }
