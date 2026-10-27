@@ -87,7 +87,7 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
     std::thread::spawn(move || {
         let mut next_scan = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            if Instant::now() < next_scan {
+            if Instant::now() < next_scan && !mi_clip::share_queue::take_device_refresh() {
                 match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(()) => (),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -125,6 +125,29 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
                     devices
                 })
                 .map_err(|_| ());
+            let catalogue = result
+                .as_ref()
+                .map(|devices| {
+                    devices
+                        .iter()
+                        .filter(|d| d.device_type == 1)
+                        .filter_map(|device| {
+                            device
+                                .addresses
+                                .iter()
+                                .find(|a| a.is_ipv4())
+                                .map(|endpoint| mi_clip::share_queue::ShareDevice {
+                                    name: device.name.clone(),
+                                    device_type: device.device_type,
+                                    endpoint: *endpoint,
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Err(error) = mi_clip::share_queue::publish_devices(catalogue) {
+                eprintln!("Mi Clip share device list unavailable: {error:#}");
+            }
             let _ = events.send_blocking(TrayEvent::Devices(result));
             next_scan = Instant::now() + Duration::from_secs(15);
         }

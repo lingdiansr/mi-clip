@@ -73,6 +73,7 @@ pub(crate) struct Sender {
 impl Sender {
     pub fn new(request: crate::share_queue::Request) -> anyhow::Result<Self> {
         let now = Instant::now();
+        crate::share_queue::validate_selected(request.target)?;
         Ok(Self {
             request,
             nonce: u32::from_ne_bytes(crate::private::random()?) & 0x7fff_ffff,
@@ -102,8 +103,9 @@ impl Sender {
         config.extend(wire::message(4, &self.key));
         config.extend(wire::message(5, &self.user_key));
         let mut user = wire::integer(1, 1);
+        user.extend(wire::message(2, b"com.cyeam.miclip"));
         user.extend(wire::message(10, &config));
-        let mut body = wire::message(2, crate::file_channel::SHARE_SERVICE.as_bytes());
+        let mut body = wire::message(2, crate::file_channel::PHONE_SHARE_SERVICE.as_bytes());
         body.extend(wire::message(3, &user));
         body.extend(wire::integer(4, 16));
         body.extend(wire::integer(5, 10000));
@@ -157,6 +159,7 @@ impl Sender {
         self.reliable = Some(reliable);
         self.address = Some(address);
         self.activity = Instant::now();
+        eprintln!("Mi Clip Share: peer port accepted; starting encrypted transfer channel");
         Ok(())
     }
     fn send(&mut self, message: &[u8]) -> anyhow::Result<()> {
@@ -225,6 +228,7 @@ impl Sender {
                 self.data_key = Some(key);
                 self.send(&ft::byte_message(0, &self.manifest()?)?)?;
                 self.announced = true;
+                eprintln!("Mi Clip Share: file manifest sent; waiting for phone acceptance");
                 self.request.status("waiting", 0)?;
             }
             (0x100, 2) => {
@@ -246,6 +250,7 @@ impl Sender {
                                 "Phone declined file sharing"
                             );
                             self.accepted = true;
+                            eprintln!("Mi Clip Share: phone accepted file manifest");
                             self.announce_streams()?;
                         }
                         8 => {
@@ -374,7 +379,7 @@ mod tests {
         std::fs::write(directory.join("files/empty.bin"), b"").unwrap();
         std::fs::write(
             directory.join("request.json"),
-            br#"["sample.txt","empty.bin"]"#,
+            br#"{"files":["sample.txt","empty.bin"],"target":"127.0.0.1:1"}"#,
         )
         .unwrap();
         let request = crate::share_queue::Request::next(&root.join("outbox"))

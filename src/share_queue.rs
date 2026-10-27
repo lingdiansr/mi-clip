@@ -7,12 +7,21 @@ use std::{
 
 pub(crate) struct Request {
     directory: PathBuf,
+    pub target: std::net::SocketAddr,
     pub offer: std::sync::Arc<crate::clipboard_files::Offer>,
     finished: bool,
+    failure: Option<String>,
     last_progress: std::time::Instant,
 }
 impl Request {
+    #[cfg(test)]
     pub fn next(root: &Path) -> anyhow::Result<Option<Self>> {
+        Self::next_for(root, None)
+    }
+    pub fn next_for(
+        root: &Path,
+        target: Option<std::net::SocketAddr>,
+    ) -> anyhow::Result<Option<Self>> {
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -36,7 +45,21 @@ impl Request {
             }
             let bytes = std::fs::read(directory.join("request.json"))?;
             anyhow::ensure!(bytes.len() <= 65536, "Oversized share request");
-            let names: Vec<String> = serde_json::from_slice(&bytes)?;
+            let description: Description = match serde_json::from_slice(&bytes) {
+                Ok(description) => description,
+                Err(_) => {
+                    // Old extensions did not carry a selected target. Never
+                    // guess one, or let a stale request block newer selections.
+                    let _ = crate::private::save(&directory.join("status.json"),
+                        br#"{"state":"failed","sent":0,"message":"Select a device in the updated Clip sharing window"}"#);
+                    continue;
+                }
+            };
+            validate_selected(description.target)?;
+            if target.is_some_and(|target| target != description.target) {
+                continue;
+            }
+            let names = description.files;
             anyhow::ensure!((1..=128).contains(&names.len()), "Invalid share file count");
             let paths = names
                 .iter()
@@ -48,8 +71,10 @@ impl Request {
             let offer = crate::clipboard_files::Offer::open(paths, 0)?;
             let mut request = Self {
                 directory,
+                target: description.target,
                 offer: std::sync::Arc::new(offer),
                 finished: false,
+                failure: None,
                 last_progress: std::time::Instant::now(),
             };
             request.status("connecting", 0)?;
@@ -81,7 +106,7 @@ impl Request {
             .open(&temp)?;
         let result = (|| -> anyhow::Result<()> {
             file.write_all(&serde_json::to_vec(
-                &serde_json::json!({"state": state, "sent": sent}),
+                &serde_json::json!({"state": state, "sent": sent, "message": self.failure}),
             )?)?;
             std::fs::rename(&temp, self.directory.join("status.json"))?;
             Ok(())
@@ -90,6 +115,12 @@ impl Request {
             let _ = std::fs::remove_file(temp);
         }
         result?;
+        Ok(())
+    }
+    pub fn fail(&mut self, message: &str) -> anyhow::Result<()> {
+        self.failure = Some(message.to_owned());
+        self.status("failed", 0)?;
+        self.finished = true;
         Ok(())
     }
     pub fn complete(&mut self) -> anyhow::Result<()> {
@@ -115,6 +146,117 @@ pub(crate) fn root() -> Option<PathBuf> {
     ))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Description {
+    files: Vec<String>,
+    target: std::net::SocketAddr,
+}
+pub(crate) fn validate_selected(target: std::net::SocketAddr) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        target.port() != 0 && !target.ip().is_unspecified() && !target.ip().is_multicast(),
+        "Invalid selected device"
+    );
+    Ok(())
+}
+/// Inspect only ready, unclaimed requests. Opening the share sheet or loading
+/// files does not create one: the user must first choose a device and press Send.
+pub fn pending_target() -> Option<std::net::SocketAddr> {
+    let root = root()?;
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if dir.extension().is_none_or(|e| e != "ready") || dir.join("status.json").exists() {
+            continue;
+        }
+        let metadata = entry.metadata().ok()?;
+        if !metadata.is_dir()
+            || metadata
+                .modified()
+                .ok()?
+                .elapsed()
+                .unwrap_or_default()
+                .as_secs()
+                > 120
+        {
+            continue;
+        }
+        let path = dir.join("request.json");
+        if std::fs::metadata(&path).ok()?.len() > 65536 {
+            continue;
+        }
+        let Ok(data) = serde_json::from_slice::<Description>(&std::fs::read(path).ok()?) else {
+            continue;
+        };
+        if validate_selected(data.target).is_ok() {
+            return Some(data.target);
+        }
+    }
+    None
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShareDevice {
+    pub name: String,
+    pub device_type: u8,
+    pub endpoint: std::net::SocketAddr,
+}
+pub fn fail_pending(target: std::net::SocketAddr, message: &str) {
+    if let Some(root) = root()
+        && let Ok(Some(mut request)) = Request::next_for(&root, Some(target))
+    {
+        let _ = request.fail(message);
+    }
+}
+pub fn take_device_refresh() -> bool {
+    root()
+        .and_then(|p| p.parent().map(|p| p.join("refresh-devices")))
+        .is_some_and(|p| std::fs::remove_file(p).is_ok())
+}
+static DISCOVERED: std::sync::Mutex<Vec<ShareDevice>> = std::sync::Mutex::new(Vec::new());
+static CONNECTED: std::sync::Mutex<Option<std::net::SocketAddr>> = std::sync::Mutex::new(None);
+pub fn set_connected(target: Option<std::net::SocketAddr>) {
+    *CONNECTED.lock().unwrap() = target;
+    let devices = DISCOVERED.lock().unwrap().clone();
+    let _ = write_devices(devices);
+}
+/// Short-lived, private device catalogue for the sandboxed picker. No account
+/// information, certificates, clipboard data, or file contents enter this file.
+pub fn publish_devices(devices: Vec<ShareDevice>) -> anyhow::Result<()> {
+    *DISCOVERED.lock().unwrap() = devices.clone();
+    write_devices(devices)
+}
+fn write_devices(mut devices: Vec<ShareDevice>) -> anyhow::Result<()> {
+    if let Some(endpoint) = *CONNECTED.lock().unwrap()
+        && !devices.iter().any(|d| d.endpoint == endpoint)
+    {
+        devices.push(ShareDevice {
+            name: "已连接的手机".into(),
+            device_type: 1,
+            endpoint,
+        });
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    let Some(root) = root().and_then(|p| p.parent().map(Path::to_path_buf)) else {
+        return Ok(());
+    };
+    // Wait for macOS/the extension to create its own sandbox container.
+    // Creating another app's container from outside can prevent sandbox launch.
+    if !root.parent().is_some_and(Path::exists) {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    crate::private::save(
+        &root.join("devices.json"),
+        &serde_json::to_vec(&serde_json::json!({"updated": now, "devices": devices}))?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,7 +271,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("files")).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(dir.join("files/test.txt"), b"synthetic").unwrap();
-        std::fs::write(dir.join("request.json"), br#"["test.txt"]"#).unwrap();
+        std::fs::write(
+            dir.join("request.json"),
+            br#"{"files":["test.txt"],"target":"127.0.0.1:1"}"#,
+        )
+        .unwrap();
         let request = Request::next(&root).unwrap().unwrap();
         assert!(Request::next(&root).unwrap().is_none());
         assert_eq!(request.offer.read(0, 0).unwrap(), b"synthetic");
@@ -138,8 +284,60 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap()).unwrap();
         assert_eq!(status["state"], "failed");
         std::fs::remove_file(dir.join("status.json")).unwrap();
-        std::fs::write(dir.join("request.json"), br#"["../private.txt"]"#).unwrap();
+        std::fs::write(
+            dir.join("request.json"),
+            br#"{"files":["../private.txt"],"target":"127.0.0.1:1"}"#,
+        )
+        .unwrap();
         assert!(Request::next(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn queued_selection_never_falls_back_to_another_connected_phone() {
+        let root = std::env::temp_dir().join(format!(
+            "clip-selection-{:016x}",
+            u64::from_ne_bytes(crate::private::random().unwrap())
+        ));
+        let dir = root.join("request.ready");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(dir.join("files/test.txt"), b"synthetic").unwrap();
+        // A pre-selection request is invalid; it must not auto-pick a phone.
+        std::fs::write(dir.join("request.json"), br#"{"files":["test.txt"]}"#).unwrap();
+        assert!(
+            Request::next_for(&root, Some("127.0.0.1:2".parse().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(dir.join("status.json").exists());
+        std::fs::remove_file(dir.join("status.json")).unwrap();
+        std::fs::write(
+            dir.join("request.json"),
+            br#"{"files":["test.txt"],"target":"127.0.0.1:1"}"#,
+        )
+        .unwrap();
+        assert!(
+            Request::next_for(&root, Some("127.0.0.1:2".parse().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!dir.join("status.json").exists());
+        let mut request = Request::next_for(&root, Some("127.0.0.1:1".parse().unwrap()))
+            .unwrap()
+            .unwrap();
+        request.fail("Phone did not accept the request").unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status["state"], "failed");
+        assert_eq!(status["message"], "Phone did not accept the request");
+        assert_eq!(status["sent"], 0);
+        drop(request);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

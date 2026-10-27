@@ -9,7 +9,8 @@ use p256::ecdsa::{SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 
 fn bytes(input: &[u8], field: u32) -> anyhow::Result<&[u8]> {
-    wire::bytes_field(input, field).ok_or_else(|| anyhow::anyhow!("Missing file-channel field"))
+    wire::bytes_field(input, field)
+        .ok_or_else(|| anyhow::anyhow!("Missing file-channel byte field {field}"))
 }
 fn number(input: &[u8], field: u32) -> Option<u64> {
     wire::fields(input)?.into_iter().find_map(|f| match f {
@@ -25,6 +26,9 @@ pub(crate) struct Incoming {
 }
 
 pub(crate) const SHARE_SERVICE: &str = "com.xiaomi.hyperConnect:miLyraShareTransfer";
+// A connection names the service on its recipient. Android advertises the
+// transfer service under its Mi Share package, not the Mac package above.
+pub(crate) const PHONE_SHARE_SERVICE: &str = "com.miui.mishare.connectivity:miLyraShareTransfer";
 pub(crate) fn clipboard_service(service: &str) -> bool {
     matches!(
         service,
@@ -47,7 +51,7 @@ pub(crate) fn sync_reply_for_service(
     service: &str,
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
-        service == SHARE_SERVICE || clipboard_service(service),
+        service == SHARE_SERVICE || service == PHONE_SHARE_SERVICE || clipboard_service(service),
         "Unsupported local service"
     );
     use crate::wire::{integer, message};
@@ -955,12 +959,33 @@ pub(crate) fn incoming_to(
         return Ok(None);
     }
     let sync = bytes(inner, 6)?;
-    let service = match bytes(sync, 4)? {
-        b"com.xiaomi.hyperConnect:miLyraShareTransfer" => SHARE_SERVICE,
-        b"com.xiaomi.hyperConnect:universalClipboard" => {
+    let sync_fields =
+        wire::fields(sync).ok_or_else(|| anyhow::anyhow!("Malformed file-channel sync info"))?;
+    let mut service_fields = sync_fields
+        .iter()
+        .filter(|field| matches!(field, Field::Integer(4, _) | Field::Bytes(4, _)));
+    let service_name = match service_fields.next() {
+        Some(Field::Bytes(_, value)) => Some(*value),
+        None => None,
+        _ => anyhow::bail!("Invalid file-channel service name"),
+    };
+    anyhow::ensure!(
+        service_fields.next().is_none(),
+        "Duplicate file-channel service name"
+    );
+    // A server's sync response need not echo the requested service name. The
+    // initiator has already selected it; still require the current channel's
+    // nonce, destination, encrypted credential and enrolled peer signature.
+    let service = match service_name {
+        None | Some(b"") if destination == 2 => PHONE_SHARE_SERVICE,
+        Some(b"com.xiaomi.hyperConnect:miLyraShareTransfer") => SHARE_SERVICE,
+        Some(b"com.miui.mishare.connectivity:miLyraShareTransfer") if destination != 0 => {
+            PHONE_SHARE_SERVICE
+        }
+        Some(b"com.xiaomi.hyperConnect:universalClipboard") => {
             "com.xiaomi.hyperConnect:universalClipboard"
         }
-        b"com.milink.service:universalClipboard" => "com.milink.service:universalClipboard",
+        Some(b"com.milink.service:universalClipboard") => "com.milink.service:universalClipboard",
         _ => return Ok(None),
     };
     anyhow::ensure!(logical.len() <= 4096, "Oversized file-channel request");
@@ -1000,6 +1025,41 @@ pub(crate) fn incoming_to(
         nonce,
         service,
     }))
+}
+
+pub(crate) fn incoming_share_response(
+    logical: &[u8],
+    key: &[u8; 32],
+    peer: &VerifyingKey,
+    nonce: u32,
+) -> anyhow::Result<Option<Incoming>> {
+    if number(logical, 2) != Some(2) || number(logical, 3) != Some(u64::from(nonce)) {
+        return Ok(None);
+    }
+    let inner = bytes(logical, 5)?;
+    if number(inner, 1) != Some(5) {
+        return Ok(None);
+    }
+    if std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
+        let fields = wire::fields(bytes(inner, 6)?)
+            .ok_or_else(|| anyhow::anyhow!("Malformed share sync response"))?;
+        let schema: Vec<_> = fields
+            .iter()
+            .map(|f| match f {
+                Field::Bytes(id, _) => format!("{id}:bytes"),
+                Field::Integer(id, _) => format!("{id}:integer"),
+            })
+            .collect();
+        eprintln!("Mi Clip Share: sync response fields {}", schema.join(", "));
+    }
+    let response = incoming_to(logical, key, peer, 2)?;
+    anyhow::ensure!(
+        response
+            .as_ref()
+            .is_some_and(|r| r.service == PHONE_SHARE_SERVICE),
+        "Unexpected share response service"
+    );
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1379,5 +1439,109 @@ mod tests {
         let end = logical.len() - 1;
         logical[end] ^= 1;
         assert!(incoming(&logical, &key, signing.verifying_key()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod share_recipient_tests {
+    use super::*;
+    fn server_reply(
+        key: &[u8; 32],
+        signing: &SigningKey,
+        service: Option<&[u8]>,
+        credential: bool,
+    ) -> Vec<u8> {
+        let original =
+            sync_reply_for_service(key, signing, "synthetic", PHONE_SHARE_SERVICE).unwrap();
+        let mut sync = Vec::new();
+        for field in wire::fields(bytes(&original, 6).unwrap()).unwrap() {
+            match field {
+                Field::Bytes(4, _) => (),
+                Field::Bytes(6, _) if !credential => (),
+                Field::Bytes(id, value) => sync.extend(wire::message(id, value)),
+                Field::Integer(id, value) => sync.extend(wire::integer(id, value)),
+            }
+        }
+        if let Some(service) = service {
+            sync.extend(wire::message(4, service));
+        }
+        let mut inner = wire::integer(1, 5);
+        inner.extend(wire::message(6, &sync));
+        let mut logical = wire::integer(1, 3);
+        logical.extend(wire::integer(2, 2));
+        logical.extend(wire::integer(3, 123));
+        logical.extend(wire::message(5, &inner));
+        logical
+    }
+    #[test]
+    fn server_may_omit_the_echo_but_not_the_authenticated_credential() {
+        let signing = SigningKey::from_slice(&[1; 32]).unwrap();
+        let other = SigningKey::from_slice(&[2; 32]).unwrap();
+        let key = [3; 32];
+        for service in [
+            None,
+            Some(b"".as_slice()),
+            Some(PHONE_SHARE_SERVICE.as_bytes()),
+        ] {
+            let reply = server_reply(&key, &signing, service, true);
+            let response = incoming_share_response(&reply, &key, signing.verifying_key(), 123)
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.service, PHONE_SHARE_SERVICE);
+            assert!(
+                incoming_share_response(&reply, &key, signing.verifying_key(), 124)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                incoming_share_response(&reply, &[4; 32], signing.verifying_key(), 123).is_err()
+            );
+            assert!(incoming_share_response(&reply, &key, other.verifying_key(), 123).is_err());
+            let mut tampered = reply;
+            *tampered.last_mut().unwrap() ^= 1;
+            assert!(
+                incoming_share_response(&tampered, &key, signing.verifying_key(), 123).is_err()
+            );
+        }
+        let missing_proof = server_reply(&key, &signing, None, false);
+        assert!(
+            incoming_share_response(&missing_proof, &key, signing.verifying_key(), 123).is_err()
+        );
+        let wrong_service = server_reply(&key, &signing, Some(SHARE_SERVICE.as_bytes()), true);
+        assert!(
+            incoming_share_response(&wrong_service, &key, signing.verifying_key(), 123).is_err()
+        );
+    }
+    #[test]
+    fn outgoing_service_matches_the_phone_advertisement_and_keeps_mac_receiver_distinct() {
+        let signing = SigningKey::from_slice(&[1; 32]).unwrap();
+        let key = [3; 32];
+        let frame =
+            sync_reply_for_service(&key, &signing, "synthetic", PHONE_SHARE_SERVICE).unwrap();
+        let sync = bytes(&frame, 6).unwrap();
+        assert_eq!(
+            bytes(sync, 4).unwrap(),
+            format!(
+                "{}:{}",
+                crate::networking::PHONE_PACKAGE,
+                crate::networking::FILE_TRANSFER
+            )
+            .as_bytes()
+        );
+        assert_ne!(PHONE_SHARE_SERVICE, SHARE_SERVICE);
+        let mut logical = crate::wire::integer(1, 3);
+        logical.extend(crate::wire::integer(2, 2));
+        logical.extend(crate::wire::integer(3, 123));
+        logical.extend(crate::wire::message(5, &frame));
+        assert!(
+            incoming_to(&logical, &key, signing.verifying_key(), 2)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            incoming(&logical, &key, signing.verifying_key())
+                .unwrap()
+                .is_none()
+        );
     }
 }

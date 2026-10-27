@@ -30,3 +30,5 @@
 !/macos/*.swift
 !/macos/*.entitlements
 !/tools/build-app.sh
+
+!/tools/build-icon.swift

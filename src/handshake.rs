@@ -625,7 +625,15 @@ fn exchange(
     config
         .services
         .get_or_insert_with(crate::networking::Service::local_services);
-    if stop.is_some() {
+    #[cfg(feature = "file-sharing")]
+    let selected_target = if stop.is_some() {
+        crate::share_queue::pending_target()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "file-sharing"))]
+    let selected_target: Option<SocketAddr> = None;
+    if stop.is_some() && selected_target.is_none() {
         use std::net::ToSocketAddrs;
         if let Ok(endpoints) = crate::discovery::discover(Duration::from_secs(3)) {
             if let Some(address) = endpoints
@@ -638,6 +646,9 @@ fn exchange(
                 config.endpoint = address;
             }
         }
+    }
+    if let Some(target) = selected_target {
+        config.endpoint = target;
     }
     anyhow::ensure!(config.endpoint.port() != 0, "No phone discovered");
     let save = |name: &str, bytes: &[u8]| -> anyhow::Result<()> {
@@ -762,7 +773,8 @@ fn exchange(
                         file_notice = None;
                     }
                     Err(error) => {
-                        diagnostic!("Outgoing share failed: {error:#}");
+                        eprintln!("Mi Clip outgoing share failed: {error:#}");
+                        let _ = sender.request.fail(&format!("{error:#}"));
                         on_event(SyncEvent::ShareFailed);
                         outgoing = None;
                         file_connection = None;
@@ -773,6 +785,15 @@ fn exchange(
                 }
             }
             if stop.is_some()
+                && outgoing.is_none()
+                && crate::share_queue::pending_target()
+                    .is_some_and(|target| target != config.endpoint)
+            {
+                // Reconnect and authenticate the chosen phone. Never let a
+                // queued share silently fall back to a different live session.
+                return Ok(());
+            }
+            if stop.is_some()
                 && network_ready
                 && outgoing.is_none()
                 && file_connection.is_none()
@@ -780,7 +801,7 @@ fn exchange(
             {
                 share_scan = Instant::now();
                 if let Some(root) = crate::share_queue::root() {
-                    match crate::share_queue::Request::next(&root) {
+                    match crate::share_queue::Request::next_for(&root, Some(config.endpoint)) {
                         Ok(Some(request)) => {
                             let sender = crate::share_sender::Sender::new(request)?;
                             let signing = p256::ecdsa::SigningKey::from_slice(
@@ -791,7 +812,7 @@ fn exchange(
                                 active_key.as_ref().unwrap(),
                                 &signing,
                                 &session.user_id,
-                                crate::file_channel::SHARE_SERVICE,
+                                crate::file_channel::PHONE_SHARE_SERVICE,
                             )?;
                             let mut logical = integer(1, 2);
                             logical.extend(integer(3, sender.nonce.into()));
@@ -801,7 +822,7 @@ fn exchange(
                             on_event(SyncEvent::ShareStarted);
                         }
                         Err(error) => {
-                            diagnostic!("Share queue rejected: {error:#}");
+                            eprintln!("Mi Clip share request rejected: {error:#}");
                         }
                         Ok(None) => (),
                     }
@@ -1008,19 +1029,57 @@ fn exchange(
             #[cfg(feature = "file-sharing")]
             if let (Some(sender), Some(peer)) = (outgoing.as_mut(), peer_key.as_ref()) {
                 if number(logical, 2).unwrap_or(0) == 2
+                    && number(logical, 3).unwrap_or(0) == u64::from(sender.nonce)
+                    && number(logical, 4).unwrap_or(0) == 0
+                    && nested(logical, &[5]).is_ok_and(|body| number(body, 1).unwrap_or(0) == 4)
+                {
+                    let code = nested(logical, &[5, 5])
+                        .ok()
+                        .and_then(|b| number(b, 1).ok())
+                        .unwrap_or(0);
+                    let reason = format!("手机关闭了分享通道（错误码 {code}），未开始发送文件");
+                    let _ = sender.request.fail(&reason);
+                    eprintln!("Mi Clip Share: {reason}");
+                    on_event(SyncEvent::ShareFailed);
+                    outgoing = None;
+                    file_connection = None;
+                    file_service = None;
+                    continue;
+                }
+                if number(logical, 2).unwrap_or(0) == 2
                     && number(logical, 4).unwrap_or(0) == 0
                     && number(logical, 3).unwrap_or(0) == u64::from(sender.nonce)
-                    && let Some(incoming) =
-                        crate::file_channel::incoming_to(logical, session_key, peer, 2)?
                 {
+                    let incoming = match crate::file_channel::incoming_share_response(
+                        logical,
+                        session_key,
+                        peer,
+                        sender.nonce,
+                    ) {
+                        Ok(Some(incoming)) => incoming,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let reason = format!("分享握手失败：{error:#}");
+                            let _ = sender.request.fail(&reason);
+                            eprintln!("Mi Clip Share: {reason}");
+                            on_event(SyncEvent::ShareFailed);
+                            outgoing = None;
+                            file_connection = None;
+                            file_service = None;
+                            continue;
+                        }
+                    };
                     anyhow::ensure!(
-                        incoming.service == crate::file_channel::SHARE_SERVICE
+                        incoming.service == crate::file_channel::PHONE_SHARE_SERVICE
                             && sender.peer.is_none(),
                         "Unexpected share proof"
                     );
                     sender.peer = Some(incoming.peer_id);
                     file_connection = Some((incoming.peer_id, incoming.nonce));
-                    file_service = Some(crate::file_channel::SHARE_SERVICE);
+                    file_service = Some(crate::file_channel::PHONE_SHARE_SERVICE);
+                    eprintln!(
+                        "Mi Clip Share: phone service proof verified; requesting logical channel"
+                    );
                     transport.send(&logical_packet(
                         2,
                         incoming.peer_id.into(),
@@ -1174,13 +1233,24 @@ fn exchange(
                             "Unexpected share logical response"
                         );
                         let response = nested(&plaintext, &[3])?;
-                        anyhow::ensure!(
-                            number(response, 1).unwrap_or(0) == 0,
-                            "Phone rejected share connection"
-                        );
+                        let code = number(response, 1).unwrap_or(0) as u32 as i32;
+                        if code != 0 {
+                            let reason =
+                                format!("手机拒绝建立分享通道（错误码 {code}），文件尚未发送");
+                            sender.request.fail(&reason)?;
+                            eprintln!("Mi Clip Share: {reason}");
+                            on_event(SyncEvent::ShareFailed);
+                            outgoing = None;
+                            file_connection = None;
+                            file_service = None;
+                            continue;
+                        }
                         let mut ack = integer(1, 3);
                         ack.extend(message(4, &[]));
                         transport.send(&logical_encrypted(&reply[4..], session_key, &ack)?)?;
+                        eprintln!(
+                            "Mi Clip Share: phone accepted logical channel; requesting transfer port"
+                        );
                         let mut payload = vec![sender.peer.unwrap(), 0];
                         payload.extend(sender.port_request()?);
                         transport.send(&frame(0x29, &payload)?)?;
