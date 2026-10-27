@@ -1,5 +1,6 @@
 import Cocoa
 import UniformTypeIdentifiers
+import QuartzCore
 
 private final class DeviceGridView: NSView {
     override var isFlipped: Bool { true }
@@ -8,6 +9,11 @@ private final class DeviceCardButton: NSButton {
     override var isFlipped: Bool { true }
     let deviceIcon = NSImageView(frame: .zero)
     let deviceName = NSTextField(labelWithString: "")
+    let deviceDetail = NSTextField(labelWithString: "")
+    let brandLogo = NSImageView(frame: .zero)
+    private let avatar = CALayer()
+    private let ring = CAShapeLayer()
+    private var animating = false
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         configureContents()
@@ -19,14 +25,54 @@ private final class DeviceCardButton: NSButton {
     private func configureContents() {
         title = ""
         isBordered = false
-        deviceIcon.frame = NSRect(x: 33, y: 14, width: 44, height: 38)
+        wantsLayer = true
+        avatar.frame = NSRect(x: 21, y: 2, width: 68, height: 68)
+        avatar.cornerRadius = 34
+        avatar.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.10).cgColor
+        avatar.isHidden = true
+        layer?.addSublayer(avatar)
+        ring.frame = NSRect(x: 21, y: 2, width: 68, height: 68)
+        ring.path = CGPath(ellipseIn: CGRect(x: 3, y: 3, width: 62, height: 62), transform: nil)
+        ring.fillColor = NSColor.clear.cgColor
+        ring.strokeColor = NSColor.controlAccentColor.cgColor
+        ring.lineWidth = 3
+        ring.lineCap = .round
+        ring.strokeEnd = 0.75
+        ring.isHidden = true
+        layer?.addSublayer(ring)
+        deviceIcon.frame = NSRect(x: 27, y: 10, width: 56, height: 52)
+        deviceIcon.wantsLayer = true
+        deviceName.wantsLayer = true
         deviceIcon.imageScaling = .scaleProportionallyDown
-        deviceName.frame = NSRect(x: 7, y: 66, width: 96, height: 22)
+        deviceName.frame = NSRect(x: 7, y: 76, width: 96, height: 22)
         deviceName.alignment = .center
         deviceName.font = .systemFont(ofSize: 12, weight: .medium)
         deviceName.lineBreakMode = .byTruncatingTail
+        deviceDetail.frame = NSRect(x: 4, y: 99, width: 102, height: 16)
+        deviceDetail.font = .systemFont(ofSize: 10)
+        deviceDetail.textColor = .secondaryLabelColor
+        deviceDetail.alignment = .center
+        deviceDetail.lineBreakMode = .byTruncatingTail
+        brandLogo.wantsLayer = true
+        brandLogo.imageScaling = .scaleProportionallyUpOrDown
         addSubview(deviceIcon)
         addSubview(deviceName)
+        addSubview(deviceDetail)
+        addSubview(brandLogo)
+    }
+    func setTransferring(_ active: Bool) {
+        guard active != animating else { return }
+        animating = active
+        ring.isHidden = !active
+        avatar.isHidden = !active
+        if active && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+            rotation.fromValue = 0
+            rotation.toValue = Double.pi * 2
+            rotation.duration = 1.2
+            rotation.repeatCount = .infinity
+            ring.add(rotation, forKey: "transfer")
+        } else { ring.removeAnimation(forKey: "transfer") }
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         // The whole card, including its icon and label, selects the device.
@@ -37,6 +83,8 @@ private struct ShareDeviceChoice {
     let endpoint: String
     let name: String
     let type: Int
+    var brand: ShareDeviceBrand? { ShareDeviceBrand.identify(name) }
+    var detail: String { brand.map { "\($0.title) · \(kind)" } ?? kind }
     var symbol: String {
         switch type { case 1: return "iphone"; case 2: return "laptopcomputer"; case 3: return "ipad"; default: return "desktopcomputer" }
     }
@@ -48,14 +96,19 @@ private struct ShareDeviceChoice {
 @objc(ShareViewController)
 final class ShareViewController: NSViewController {
     private let label = NSTextField(wrappingLabelWithString: "准备分享文件…")
-    private let button = NSButton(title: "取消", target: nil, action: nil)
+    private let closeButton = NSButton(title: "", target: nil, action: nil)
+    private let progress = NSProgressIndicator(frame: .zero)
+    private let progressLabel = NSTextField(labelWithString: "")
+    private var completed = false
+    private var closed = false
+    private var lastRefresh = Date.distantPast
     private let devices = DeviceGridView(frame: .zero)
     private let deviceScroll = NSScrollView(frame: .zero)
+    private let deviceHeading = NSTextField(labelWithString: "选择接收设备")
     private let emptyDevices = NSTextField(wrappingLabelWithString: "正在搜索可接收设备…")
     private var choices: [ShareDeviceChoice] = []
     private var selectedEndpoint: String?
     private var deviceButtons: [DeviceCardButton] = []
-    private let send = NSButton(title: "发送", target: nil, action: nil)
     private var preparedNames: [String] = []
     private var submitted = false
     private var catalogueUpdated = Date.distantPast
@@ -71,13 +124,16 @@ final class ShareViewController: NSViewController {
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 380))
         let icon = NSImageView(frame: NSRect(x: 24, y: 320, width: 36, height: 36))
-        if let path = Bundle.main.path(forResource: "Clip", ofType: "icns") { icon.image = NSImage(contentsOfFile: path) }
+        let resources = Bundle(for: ShareViewController.self)
+        icon.image = resources.image(forResource: "ClipShare")
+            ?? resources.image(forResource: "Clip")
+            ?? resources.url(forResource: "Clip", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
+            ?? NSImage(systemSymbolName: "doc.on.clipboard.fill", accessibilityDescription: "Clip")
         let title = NSTextField(labelWithString: "Clip 分享")
         title.font = .boldSystemFont(ofSize: 19)
         title.frame = NSRect(x: 74, y: 325, width: 260, height: 27)
         label.frame = NSRect(x: 24, y: 254, width: 352, height: 56)
         label.font = .systemFont(ofSize: 14)
-        let deviceHeading = NSTextField(labelWithString: "选择接收设备")
         deviceHeading.frame = NSRect(x: 24, y: 230, width: 352, height: 20)
         deviceHeading.font = .systemFont(ofSize: 12, weight: .medium)
         deviceScroll.frame = NSRect(x: 24, y: 94, width: 352, height: 128)
@@ -91,23 +147,27 @@ final class ShareViewController: NSViewController {
         emptyDevices.font = .systemFont(ofSize: 12)
         emptyDevices.textColor = .secondaryLabelColor
         devices.addSubview(emptyDevices)
-        send.frame = NSRect(x: 194, y: 16, width: 86, height: 30)
-        send.bezelStyle = .rounded
-        send.isEnabled = false
-        send.target = self
-        send.action = #selector(sendFiles)
-        let note = NSTextField(wrappingLabelWithString: "选择设备并点击发送后，才会发起文件传输。")
-        note.frame = NSRect(x: 24, y: 51, width: 352, height: 32)
-        note.font = .systemFont(ofSize: 11)
-        note.textColor = .secondaryLabelColor
-        button.frame = NSRect(x: 290, y: 16, width: 86, height: 30)
-        button.bezelStyle = .rounded
-        button.target = self
-        button.action = #selector(close)
-        let refresh = NSButton(title: "刷新设备", target: self, action: #selector(refreshDevices))
-        refresh.bezelStyle = .rounded
-        refresh.frame = NSRect(x: 24, y: 16, width: 90, height: 30)
-        [icon, title, label, deviceHeading, deviceScroll, send, note, button, refresh].forEach { view.addSubview($0) }
+        progress.frame = NSRect(x: 24, y: 64, width: 352, height: 12)
+        progress.style = .bar
+        progress.isIndeterminate = false
+        progress.minValue = 0
+        progress.maxValue = 100
+        progress.isHidden = true
+        progressLabel.frame = NSRect(x: 24, y: 34, width: 352, height: 20)
+        progressLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        progressLabel.textColor = .secondaryLabelColor
+        progressLabel.isHidden = true
+        closeButton.frame = NSRect(x: 350, y: 330, width: 28, height: 28)
+        closeButton.isBordered = false
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "关闭")
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.setAccessibilityLabel("关闭分享")
+        closeButton.toolTip = "关闭"
+        closeButton.keyEquivalent = "\u{1b}"
+        closeButton.target = self
+        closeButton.action = #selector(close)
+        [icon, title, label, deviceHeading, deviceScroll, progress, progressLabel, closeButton].forEach { view.addSubview($0) }
+
     }
     override func viewDidAppear() {
         super.viewDidAppear()
@@ -146,7 +206,7 @@ final class ShareViewController: NSViewController {
         guard !finished, let directory = directory else { return }
         if index == providers.count {
             preparedNames = names
-            label.stringValue = "已准备 \(names.count) 个文件 · 请选择接收设备。"
+            label.stringValue = "已准备 \(names.count) 个文件 · 点击设备即可发送。"
             deviceChanged()
             return
         }
@@ -205,6 +265,7 @@ final class ShareViewController: NSViewController {
     }
     @objc private func refreshDevices() {
         guard !submitted, let directory = directory else { return }
+        lastRefresh = Date()
         try? Data().write(to: directory.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("refresh-devices"), options: .atomic)
         readDevices()
@@ -230,7 +291,7 @@ final class ShareViewController: NSViewController {
             renderDevices()
             catalogueSignature = signature
         }
-        if entries.isEmpty { emptyDevices.stringValue = "未发现设备\n请解锁手机并开启互联，然后刷新。" }
+        if entries.isEmpty { emptyDevices.stringValue = "正在搜索设备…\n请解锁手机并开启互联。" }
         deviceChanged()
     }
     private func renderDevices() {
@@ -238,17 +299,25 @@ final class ShareViewController: NSViewController {
         deviceButtons.removeAll()
         emptyDevices.isHidden = !choices.isEmpty
         let rows = (choices.count + 2) / 3
-        devices.frame.size = NSSize(width: 352, height: max(128, rows * 110))
+        devices.frame.size = NSSize(width: 352, height: max(128, rows * 126))
         for (index, choice) in choices.enumerated() {
-            let card = DeviceCardButton(frame: NSRect(x: (index % 3) * 118, y: (index / 3) * 110, width: 110, height: 100))
+            let card = DeviceCardButton(frame: NSRect(x: (index % 3) * 118, y: (index / 3) * 126, width: 110, height: 118))
             card.target = self
             card.action = #selector(selectDevice(_:))
             card.tag = index
             card.deviceName.stringValue = choice.name
+            card.deviceDetail.stringValue = choice.detail
+            card.brandLogo.isHidden = choice.brand == nil
+            card.deviceIcon.isHidden = choice.brand != nil
+            card.brandLogo.frame = NSRect(x: 25, y: 6, width: 60, height: 60)
+            if let brand = choice.brand {
+                card.brandLogo.image = brand.image
+                card.brandLogo.contentTintColor = brand.color
+            }
             card.deviceIcon.image = NSImage(systemSymbolName: choice.symbol, accessibilityDescription: choice.kind)?
                 .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 32, weight: .regular))
-            card.toolTip = choice.name
-            card.setAccessibilityLabel("\(choice.name)，\(choice.kind)")
+            card.toolTip = "\(choice.name) · \(choice.detail)"
+            card.setAccessibilityLabel("\(choice.name)，\(choice.detail)")
             card.wantsLayer = true
             card.layer?.cornerRadius = 12
             devices.addSubview(card)
@@ -257,20 +326,32 @@ final class ShareViewController: NSViewController {
         deviceChanged()
     }
     @objc private func selectDevice(_ sender: NSButton) {
-        guard !submitted, !finished, choices.indices.contains(sender.tag) else { return }
+        guard !submitted, !finished, !preparedNames.isEmpty, choices.indices.contains(sender.tag) else { return }
         selectedEndpoint = choices[sender.tag].endpoint
         deviceChanged()
+        sendFiles()
     }
     @objc private func deviceChanged() {
-        send.isEnabled = !submitted && !finished && !preparedNames.isEmpty && selectedEndpoint != nil
+        deviceHeading.stringValue = submitted ? "接收设备" : "选择接收设备"
+        if submitted {
+            devices.frame.size.height = 128
+            deviceScroll.contentView.scroll(to: .zero)
+            deviceScroll.reflectScrolledClipView(deviceScroll.contentView)
+        }
         for (index, card) in deviceButtons.enumerated() {
             let selected = choices[index].endpoint == selectedEndpoint
-            card.isEnabled = !submitted && !finished
+            card.isHidden = submitted && !selected
+            card.isEnabled = !submitted && !finished && !preparedNames.isEmpty
+            if submitted && selected { card.frame.origin = NSPoint(x: 121, y: 8) }
+            card.brandLogo.frame = submitted
+                ? NSRect(x: 31, y: 12, width: 48, height: 48)
+                : NSRect(x: 25, y: 6, width: 60, height: 60)
+            card.setTransferring(submitted && selected && !finished)
             card.deviceIcon.contentTintColor = selected ? .controlAccentColor : .labelColor
             card.deviceName.textColor = selected ? .controlAccentColor : .labelColor
-            card.layer?.backgroundColor = (selected ? NSColor.controlAccentColor.withAlphaComponent(0.10) : NSColor.controlBackgroundColor).cgColor
+            card.layer?.backgroundColor = (submitted ? NSColor.clear : (selected ? NSColor.controlAccentColor.withAlphaComponent(0.10) : NSColor.controlBackgroundColor)).cgColor
             card.layer?.borderColor = (selected ? NSColor.controlAccentColor : NSColor.separatorColor.withAlphaComponent(0.35)).cgColor
-            card.layer?.borderWidth = selected ? 2 : 1
+            card.layer?.borderWidth = submitted ? 0 : (selected ? 2 : 1)
             card.setAccessibilityValue(selected ? "已选择" : "未选择")
         }
     }
@@ -279,7 +360,7 @@ final class ShareViewController: NSViewController {
               !preparedNames.isEmpty,
               let endpoint = selectedEndpoint else { return }
         guard Date().timeIntervalSince(catalogueUpdated) < 45 else {
-            label.stringValue = "设备列表已过期，请刷新后重新选择。"
+            label.stringValue = "正在重新搜索设备，请稍后点击设备发送。"
             refreshDevices()
             return
         }
@@ -291,14 +372,20 @@ final class ShareViewController: NSViewController {
             self.directory = ready
             submitted = true
             started = Date()
-            send.isEnabled = false
+            progress.isHidden = false
+            progressLabel.isHidden = false
+            updateProgress(sent: 0)
             deviceChanged()
             label.stringValue = "正在连接所选设备…\n尚未开始发送文件。"
         } catch { fail("无法提交分享：\(error.localizedDescription)") }
     }
     private func poll() {
         guard !finished, let directory = directory else { return }
-        if !submitted { readDevices(); return }
+        if !submitted {
+            if Date().timeIntervalSince(lastRefresh) >= 8 { refreshDevices() }
+            else { readDevices() }
+            return
+        }
         if let data = try? Data(contentsOf: directory.appendingPathComponent("status.json")),
            let status = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
            let state = status["state"] as? String {
@@ -307,13 +394,17 @@ final class ShareViewController: NSViewController {
             case "waiting": label.stringValue = "分享请求已发出，等待手机接受…\n如手机显示接收提示，请确认。"
             case "sending":
                 let sent = (status["sent"] as? NSNumber)?.int64Value ?? 0
-                label.stringValue = "正在发送到手机 · \(total == 0 ? 100 : min(100, Int(Double(sent) / Double(total) * 100)))%\n传输完成后将由手机确认。"
+                updateProgress(sent: sent)
+                label.stringValue = "正在发送到设备…"
             case "completed":
                 timer?.invalidate()
                 label.stringValue = "手机已确认接收完成。"
-                button.title = "完成"
+                completed = true
                 finished = true
+                updateProgress(sent: total)
+                deviceChanged()
                 cleanup()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.close() }
                 return
             case "failed":
                 let message = status["message"] as? String ?? "分享通道已断开，未收到接收完成确认。"
@@ -339,38 +430,95 @@ final class ShareViewController: NSViewController {
     private func fail(_ message: String) {
         timer?.invalidate()
         finished = true
-        send.isEnabled = false
         deviceChanged()
         label.stringValue = message
-        button.title = "关闭"
         cleanup()
     }
+    private func updateProgress(sent: Int64) {
+        let bytes = max(0, min(sent, total))
+        let percent = total == 0 ? (completed ? 100.0 : 0.0) : Double(bytes) / Double(total) * 100
+        progress.doubleValue = percent
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        progressLabel.stringValue = "\(formatter.string(fromByteCount: bytes)) / \(formatter.string(fromByteCount: total)) · \(Int(percent))%"
+        progressLabel.toolTip = "已发送 \(bytes) 字节，共 \(total) 字节"
+        progress.setAccessibilityValue("\(Int(percent))%")
+    }
     #if SHARE_PREVIEW
-    static func preview(iconPath: String) -> ShareViewController {
+    static func verifyPreview(output: URL, icon: URL) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let staging = root.appendingPathComponent("Outbox/preview.loading")
+        try FileManager.default.createDirectory(at: staging.appendingPathComponent("files"), withIntermediateDirectories: true)
         let controller = ShareViewController()
         _ = controller.view
+        let window = NSWindow(contentRect: controller.view.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = controller.view
+        window.backgroundColor = .windowBackgroundColor
         controller.loading = true
-        (controller.view.subviews.first as? NSImageView)?.image = NSImage(contentsOfFile: iconPath)
-        controller.label.stringValue = "已准备 1 个文件 · 请选择接收设备。"
+        controller.directory = staging
         controller.preparedNames = ["example.png"]
-        controller.choices = [
-            ShareDeviceChoice(endpoint: "192.0.2.1:1234", name: "小米手机", type: 1),
-            ShareDeviceChoice(endpoint: "192.0.2.2:1234", name: "测试平板", type: 3),
-            ShareDeviceChoice(endpoint: "192.0.2.3:1234", name: "测试电脑", type: 2),
-        ]
-        controller.renderDevices()
+        controller.total = 1048576
+        controller.label.stringValue = "已准备 1 个文件 · 点击设备即可发送。"
+        (controller.view.subviews.first as? NSImageView)?.image = NSImage(contentsOf: icon)
+        let catalogue: [String: Any] = ["updated": Date().timeIntervalSince1970, "devices": [
+            ["endpoint": "192.0.2.1:1234", "name": "Xiaomi 15 Pro", "device_type": 1],
+            ["endpoint": "192.0.2.2:1234", "name": "Redmi Pad", "device_type": 3],
+            ["endpoint": "192.0.2.3:1234", "name": "MacBook Pro", "device_type": 2],
+        ]]
+        try JSONSerialization.data(withJSONObject: catalogue).write(to: root.appendingPathComponent("devices.json"))
+        controller.poll()
+        precondition(FileManager.default.fileExists(atPath: root.appendingPathComponent("refresh-devices").path), "Opening must automatically request discovery")
         precondition(controller.deviceButtons.count == 3)
-        precondition(!controller.send.isEnabled, "Must choose a device before sending")
+        precondition(controller.choices.map { $0.brand } == [.xiaomi, .redmi, .apple])
+        precondition(controller.choices[1].detail == "Redmi · 平板")
+        precondition(ShareDeviceBrand.identify("我的手机") == nil)
+        precondition(ShareDeviceBrand.identify("2412DPC0AG") == nil)
+        precondition(ShareDeviceBrand.identify("Galaxy S24") == .samsung)
+        precondition(ShareDeviceBrand.identify("POCO F6") == .poco)
+        for brand in ShareDeviceBrand.allCases {
+            precondition(brand.image.tiffRepresentation != nil, "Every brand mark must render locally")
+        }
+        precondition(controller.deviceButtons.allSatisfy { !$0.brandLogo.isHidden })
+        precondition(!controller.submitted, "Discovery must not send without a device click")
+        func snapshot(_ name: String) throws {
+            controller.view.layoutSubtreeIfNeeded()
+            let bitmap = controller.view.bitmapImageRepForCachingDisplay(in: controller.view.bounds)!
+            controller.view.cacheDisplay(in: controller.view.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])!.write(to: output.appendingPathComponent(name))
+        }
+        try snapshot("devices.png")
         controller.selectDevice(controller.deviceButtons[0])
-        precondition(controller.send.isEnabled, "Selected device must enable Send")
-        precondition(controller.selectedEndpoint == "192.0.2.1:1234")
-        return controller
+        precondition(controller.submitted, "One device click must submit the transfer")
+        let ready = staging.deletingPathExtension().appendingPathExtension("ready")
+        let request = try JSONSerialization.jsonObject(with: Data(contentsOf: ready.appendingPathComponent("request.json"))) as! [String: Any]
+        precondition(request["target"] as? String == "192.0.2.1:1234")
+        controller.selectDevice(controller.deviceButtons[1])
+        precondition(controller.selectedEndpoint == "192.0.2.1:1234", "Repeated clicks must not switch an active transfer")
+        try JSONSerialization.data(withJSONObject: ["state": "sending", "sent": 524288]).write(to: ready.appendingPathComponent("status.json"))
+        controller.poll()
+        precondition(controller.progress.doubleValue == 50)
+        precondition(controller.deviceButtons[1].isHidden)
+        try snapshot("sending.png")
+        try JSONSerialization.data(withJSONObject: ["state": "completed"]).write(to: ready.appendingPathComponent("status.json"))
+        controller.poll()
+        precondition(controller.completed && controller.finished)
+        precondition(controller.progress.doubleValue == 100)
+        precondition(!FileManager.default.fileExists(atPath: ready.path))
+        // Exercise the scheduled automatic dismissal, without a phone or host app.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        precondition(controller.closed, "Receiver completion must automatically dismiss the extension")
+        print("PASS: automatic discovery, one-click submission, duplicate-click protection, byte progress and completion cleanup")
     }
     #endif
     @objc private func close() {
+        guard !closed else { return }
+        closed = true
         timer?.invalidate()
-        let success = finished && button.title == "完成"
+        let success = completed
         finished = true
+        deviceChanged()
         cleanup()
         if success { extensionContext?.completeRequest(returningItems: nil, completionHandler: nil) }
         else { extensionContext?.cancelRequest(withError: NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError)) }

@@ -160,7 +160,7 @@ pub(crate) fn validate_selected(target: std::net::SocketAddr) -> anyhow::Result<
     Ok(())
 }
 /// Inspect only ready, unclaimed requests. Opening the share sheet or loading
-/// files does not create one: the user must first choose a device and press Send.
+/// files does not create one: the user must first click a device to send.
 pub fn pending_target() -> Option<std::net::SocketAddr> {
     let root = root()?;
     let entries = std::fs::read_dir(root).ok()?;
