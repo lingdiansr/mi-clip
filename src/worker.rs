@@ -14,12 +14,17 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
     std::thread::spawn(move || {
         let mut backoff = 2;
         let mut last_error = String::new();
+        let analytics = std::cell::RefCell::new(mi_clip::analytics::Session::default());
         while !stop.load(Ordering::Relaxed) {
+            analytics.borrow_mut().begin();
             let _ = events.try_send(TrayEvent::Status("连接中", last_error.clone()));
             let connected = std::cell::Cell::new(false);
             let attempted = std::cell::Cell::new(None);
             let phase = std::cell::Cell::new("发现设备／读取配置");
             let result = handshake::sync_once(&config, &stop, &|event| {
+                if let Some(event) = analytics.borrow_mut().observe(&event) {
+                    mi_clip::analytics::capture(event);
+                }
                 let status = match event {
                     SyncEvent::File(event) => {
                         let _ = events.send_blocking(TrayEvent::File(event));
@@ -87,6 +92,11 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
                 backoff = 2;
                 last_error.clear();
                 continue;
+            }
+            if result.is_err() {
+                for event in analytics.borrow_mut().failed() {
+                    mi_clip::analytics::capture(event);
+                }
             }
             let _ = events.try_send(TrayEvent::File(mi_clip::file_feedback::Event::Failed(
                 mi_clip::file_feedback::Failure::Disconnected,

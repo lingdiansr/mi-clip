@@ -44,8 +44,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-release-${{ matrix.arch }}
-      - name: Warm protocol and updater tests
-        run: cargo test --locked --no-default-features --features research --lib
+      - name: Warm protocol, analytics and updater tests
+        run: cargo test --locked --no-default-features --features research,analytics --lib
       - name: Warm optimized release dependencies
         # Preserve the release script's encoded path-remapping Rust flags.
         run: sh tools/build-release.sh --bin mi-clip

@@ -33,7 +33,26 @@ fn number(input: &[u8], id: u32) -> anyhow::Result<u64> {
     Ok(value)
 }
 fn bytes(input: &[u8], id: u32) -> anyhow::Result<&[u8]> {
-    wire::bytes_field(input, id).ok_or_else(|| anyhow::anyhow!("Missing share response field"))
+    wire::bytes_field(input, id).ok_or_else(|| anyhow::anyhow!("Missing share response field {id}"))
+}
+fn accept_response(response: &[u8], task: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(number(response, 1)? == 1, "Wrong share request kind");
+    let fields =
+        wire::fields(response).ok_or_else(|| anyhow::anyhow!("Malformed share acceptance"))?;
+    let mut ids = fields
+        .iter()
+        .filter(|f| matches!(f, Field::Integer(2, _) | Field::Bytes(2, _)));
+    // Android acknowledges the single request on this authenticated channel
+    // with just its kind. The task echo is optional; an explicit different task
+    // must still never authorize transfer.
+    match ids.next() {
+        None => (),
+        Some(Field::Bytes(_, value)) if value.is_empty() || *value == task => (),
+        _ => anyhow::bail!("Wrong share task"),
+    }
+    anyhow::ensure!(ids.next().is_none(), "Duplicate share task");
+    anyhow::ensure!(number(response, 3)? == 0, "Phone declined file sharing");
+    Ok(())
 }
 fn node<'a>(nodes: &[ft::Node<'a>], tag: u16, kind: u16) -> anyhow::Result<&'a [u8]> {
     let mut values = nodes.iter().filter(|n| n.tag == tag);
@@ -65,6 +84,8 @@ pub(crate) struct Sender {
     accepted: bool,
     announced: bool,
     streams: Vec<(u32, usize, u64, bool, bool)>,
+    saved_streams: Vec<u32>,
+    finish_sent: bool,
     pending: Vec<u8>,
     pending_offset: usize,
     assembler: ft::BytesAssembler,
@@ -92,6 +113,8 @@ impl Sender {
             accepted: false,
             announced: false,
             streams: Vec::new(),
+            saved_streams: Vec::new(),
+            finish_sent: false,
             pending: Vec::new(),
             pending_offset: 0,
             assembler: ft::BytesAssembler::default(),
@@ -99,17 +122,36 @@ impl Sender {
         })
     }
     pub fn logical_request(&self) -> Vec<u8> {
+        use base64::Engine;
         let mut config = wire::integer(1, self.client_id.into());
         config.extend(wire::message(4, &self.key));
         config.extend(wire::message(5, &self.user_key));
-        let mut user = wire::integer(1, 1);
-        user.extend(wire::message(2, b"com.cyeam.miclip"));
+        // UserInfo field 1 identifies the OS (Darwin = 5), not the UDP
+        // transport type used later in RequestOfPeerPort.
+        let mut user = wire::integer(1, 5);
+        user.extend(wire::message(2, crate::networking::MAC_PACKAGE.as_bytes()));
+        // The phone's Express listener requires its link-request envelope in
+        // UserInfo.userData before it will accept the underlying SDK channel.
+        let link = ft::union(1, 0x100, &ft::tlv(5, 0, b"").unwrap()).unwrap();
+        user.extend(wire::message(
+            4,
+            base64::engine::general_purpose::STANDARD
+                .encode(link)
+                .as_bytes(),
+        ));
         user.extend(wire::message(10, &config));
-        let mut body = wire::message(2, crate::file_channel::PHONE_SHARE_SERVICE.as_bytes());
+        // SDK channels require the receiver's confirmation callback to run.
+        // Without this flag the phone rejects the connection before Express
+        // can parse the link request or present the file-sharing prompt.
+        let mut body = wire::integer(1, 1);
+        body.extend(wire::message(
+            2,
+            crate::file_channel::PHONE_SHARE_SERVICE.as_bytes(),
+        ));
         body.extend(wire::message(3, &user));
-        body.extend(wire::integer(4, 16));
+        body.extend(wire::integer(4, 48));
         body.extend(wire::integer(5, 10000));
-        body.extend(wire::integer(6, 256));
+        body.extend(wire::integer(6, 128));
         body.extend(wire::integer(7, 1));
         let mut out = wire::integer(1, 1);
         out.extend(wire::message(2, &body));
@@ -171,11 +213,13 @@ impl Sender {
     }
     fn manifest(&self) -> anyhow::Result<Vec<u8>> {
         let mut body = wire::integer(1, 1);
+        body.extend(wire::message(2, crate::networking::DEVICE_NAME.as_bytes()));
         body.extend(wire::message(3, self.task.as_bytes()));
         for (i, source) in self.request.offer.files.iter().enumerate() {
             let mut file = wire::message(1, source.name.as_bytes());
             file.extend(wire::integer(2, source.size));
-            file.extend(wire::message(3, format!("{}-{i}", self.task).as_bytes()));
+            file.extend(wire::message(3, format!("file_id_{i}").as_bytes()));
+            file.extend(wire::message(5, source.mime.as_bytes()));
             body.extend(wire::message(5, &file));
         }
         let mut root = wire::integer(1, 1);
@@ -193,7 +237,7 @@ impl Sender {
             body.extend(ft::tlv(4, 2, &(file.size as i64).to_be_bytes())?);
             body.extend(ft::tlv(5, 3, file.mime.as_bytes())?);
             body.extend(ft::tlv(5, 4, file.name.as_bytes())?);
-            body.extend(ft::tlv(5, 5, format!("{}-{index}", self.task).as_bytes())?);
+            body.extend(ft::tlv(5, 5, format!("file_id_{index}").as_bytes())?);
             let express = ft::union(3, 0x100, &body)?;
             self.send(&ft::sdk_bytes(&express)?)?;
             self.streams.push((id, index, 0, false, false));
@@ -233,6 +277,28 @@ impl Sender {
             }
             (0x100, 2) => {
                 if let Some(message) = self.assembler.push(express)? {
+                    if std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
+                        let schema = |data: &[u8]| {
+                            wire::fields(data)
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|field| match field {
+                                    Field::Integer(id, value) => format!("{id}=integer({value})"),
+                                    Field::Bytes(id, value) => {
+                                        format!("{id}=bytes({})", value.len())
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        eprintln!(
+                            "Mi Clip Share: control response schema: {}",
+                            schema(&message)
+                        );
+                        if let Some(body) = wire::bytes_field(&message, 2) {
+                            eprintln!("Mi Clip Share: response body schema: {}", schema(body));
+                        }
+                    }
                     match number(&message, 1)? {
                         2 => {
                             anyhow::ensure!(
@@ -240,15 +306,7 @@ impl Sender {
                                 "Unexpected share acceptance"
                             );
                             let response = bytes(&message, 2)?;
-                            anyhow::ensure!(
-                                number(response, 1)? == 1
-                                    && bytes(response, 2)? == self.task.as_bytes(),
-                                "Wrong share task"
-                            );
-                            anyhow::ensure!(
-                                number(response, 3)? == 0,
-                                "Phone declined file sharing"
-                            );
+                            accept_response(response, self.task.as_bytes())?;
                             self.accepted = true;
                             eprintln!("Mi Clip Share: phone accepted file manifest");
                             self.announce_streams()?;
@@ -283,7 +341,41 @@ impl Sender {
                 anyhow::ensure!(!stream.3, "Duplicate share stream request");
                 stream.3 = true;
             }
-            _ => anyhow::bail!("Unsupported share response"),
+            (0x100, 5) => {
+                let fields = ft::nodes(frame.value)?;
+                let id = u32::from_be_bytes(node(&fields, 1, 3)?.try_into()?);
+                let result = i32::from_be_bytes(node(&fields, 2, 3)?.try_into()?);
+                // This is MiContPacketTransferState: NONE=0, SUCCESS=1.
+                // It is not the manifest's RejectReason (where 0 accepts).
+                anyhow::ensure!(result == 1, "Phone failed to save share stream ({result})");
+                let stream = self
+                    .streams
+                    .iter()
+                    .find(|s| s.0 == id)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown share stream completion"))?;
+                anyhow::ensure!(
+                    stream.3 && stream.4 && self.pending.is_empty(),
+                    "Premature share stream completion"
+                );
+                // Stream receipt precedes the task's command 8. Keep waiting
+                // for that overall confirmation before completing the request.
+                if !self.saved_streams.contains(&id) {
+                    self.saved_streams.push(id);
+                }
+                eprintln!("Mi Clip Share: phone confirmed a saved file stream");
+            }
+            _ => {
+                let schema = ft::nodes(frame.value)?
+                    .iter()
+                    .map(|n| format!("{}:{}({})", n.tag, n.kind, n.value.len()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "Unsupported share response {:#x}/{}: {schema}",
+                    frame.kind,
+                    frame.tag
+                );
+            }
         }
         Ok(())
     }
@@ -358,6 +450,22 @@ impl Sender {
                 Err(e) => return Err(e.into()),
             }
         }
+        if self.accepted
+            && !self.finish_sent
+            && !self.streams.is_empty()
+            && self.saved_streams.len() == self.streams.len()
+            && self.streams.iter().all(|s| s.4)
+            && self.pending.is_empty()
+        {
+            // Native FileSendComplete (7) is sent by the sender after every
+            // successful stream receipt. Android then returns response 8 and
+            // leaves its "receiving" state.
+            let mut finish = wire::integer(1, 7);
+            finish.extend(wire::message(2, &wire::integer(1, 1)));
+            self.send(&ft::byte_message(0, &finish)?)?;
+            self.finish_sent = true;
+            eprintln!("Mi Clip Share: all file streams saved; task finish sent");
+        }
         Ok(false)
     }
 }
@@ -366,6 +474,23 @@ impl Sender {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn android_acceptance_can_omit_task_echo_but_cannot_change_or_reject_it() {
+        // Actual Android acceptance body: request kind only, default reason 0.
+        let android = [0x08, 0x01];
+        accept_response(&android, b"task-one").unwrap();
+        let mut echoed = android.to_vec();
+        echoed.extend(wire::message(2, b"task-one"));
+        accept_response(&echoed, b"task-one").unwrap();
+        assert!(accept_response(&echoed, b"task-two").is_err());
+        echoed.extend(wire::message(2, b"task-one"));
+        assert!(accept_response(&echoed, b"task-one").is_err());
+        let mut rejected = android.to_vec();
+        rejected.extend(wire::integer(3, 1));
+        assert!(accept_response(&rejected, b"task-one").is_err());
+        assert!(accept_response(&[0x08, 0x02], b"task-one").is_err());
+    }
 
     fn setup() -> (std::path::PathBuf, Sender) {
         let root = std::env::temp_dir().join(format!(
@@ -387,6 +512,36 @@ mod tests {
             .unwrap();
         (root, Sender::new(request).unwrap())
     }
+    #[test]
+    fn logical_share_request_contains_express_link_and_wifi_medium() {
+        use base64::Engine;
+        let (root, sender) = setup();
+        let request = sender.logical_request();
+        let body = bytes(&request, 2).unwrap();
+        assert_eq!(number(body, 1).unwrap(), 1);
+        assert_eq!(number(body, 4).unwrap(), 48);
+        assert_eq!(number(body, 6).unwrap(), 128);
+        let user = bytes(body, 3).unwrap();
+        assert_eq!(number(user, 1).unwrap(), 5);
+        assert_eq!(
+            bytes(user, 2).unwrap(),
+            crate::networking::MAC_PACKAGE.as_bytes()
+        );
+        let link = base64::engine::general_purpose::STANDARD
+            .decode(bytes(user, 4).unwrap())
+            .unwrap();
+        // Express's TlvExpressLink selects request branch 1, with an empty
+        // user-data string in field 0. An ordinary SDK channel omits this.
+        assert_eq!(
+            link,
+            [
+                1, 1, 255, 255, 0, 0, 0, 18, 0, 1, 1, 0, 0, 1, 0, 0, 0, 8, 0, 5, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        drop(sender);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn direct_share_saves_multiple_files_and_waits_for_receiver_confirmation() {
         let (root, mut sender) = setup();
@@ -462,6 +617,30 @@ mod tests {
         assert!(!sender.complete);
         std::fs::remove_dir_all(root.join("outbox/test.ready")).unwrap();
         assert!(sender.poll().is_err());
+        drop(sender);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saved_stream_receipt_waits_for_task_completion_and_rejects_failure() {
+        let (root, mut sender) = setup();
+        let receipt = |code: i32, id: u32| {
+            let mut body = ft::tlv(3, 0, &0u32.to_be_bytes()).unwrap();
+            body.extend(ft::tlv(3, 1, &id.to_be_bytes()).unwrap());
+            body.extend(ft::tlv(3, 2, &code.to_be_bytes()).unwrap());
+            let express = ft::union(5, 0x100, &body).unwrap();
+            ft::seal(&sender.key, &ft::sdk_bytes(&express).unwrap()).unwrap()
+        };
+        let okay = receipt(1, 1);
+        let failure = receipt(3, 1);
+        let unknown = receipt(1, 2);
+        assert!(sender.receive(&okay).is_err());
+        sender.accepted = true;
+        sender.streams.push((1, 0, 70001, true, true));
+        sender.receive(&okay).unwrap();
+        assert!(!sender.complete);
+        assert!(sender.receive(&failure).is_err());
+        assert!(sender.receive(&unknown).is_err());
         drop(sender);
         std::fs::remove_dir_all(root).unwrap();
     }

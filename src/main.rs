@@ -108,6 +108,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    if !smoke {
+        if let Some(home) = std::env::var_os("HOME") {
+            mi_clip::analytics::start(
+                std::path::PathBuf::from(home).join("Library/Application Support/MiClip"),
+            );
+        }
+    }
     let passed = std::rc::Rc::new(std::cell::Cell::new(false));
     let signal = passed.clone();
     let runtime = Runtime::default();
@@ -127,6 +134,7 @@ fn main() -> anyhow::Result<()> {
                     .stop
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 drop(instance.take());
+                mi_clip::analytics::shutdown();
                 if quitting
                     .install_update
                     .load(std::sync::atomic::Ordering::Relaxed)

@@ -106,7 +106,6 @@ pub(crate) struct PortRequest {
 /// The encrypted logical request commits to the bulk keys before the plaintext
 /// port-control packet arrives. Never trust the latter as a key exchange.
 pub(crate) struct PortBinding {
-    channel_type: u32,
     client_id: u32,
     transfer_key: [u8; 32],
     user_key: [u8; 32],
@@ -114,13 +113,14 @@ pub(crate) struct PortBinding {
 impl PortBinding {
     pub fn from_user_info(user: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(user.len() <= 4096, "Oversized bulk user info");
+        anyhow::ensure!(
+            matches!(number(user, 1), Some(1 | 5)),
+            "Unsupported bulk peer platform"
+        );
         let config = bytes(user, 10)?;
         Ok(Self {
             client_id: u32::try_from(
                 number(config, 1).ok_or_else(|| anyhow::anyhow!("Missing bulk client ID"))?,
-            )?,
-            channel_type: u32::try_from(
-                number(user, 1).ok_or_else(|| anyhow::anyhow!("Missing bulk channel type"))?,
             )?,
             transfer_key: bytes(config, 4)?.try_into()?,
             user_key: bytes(config, 5)?.try_into()?,
@@ -129,7 +129,7 @@ impl PortBinding {
     pub fn verify(&self, request: &PortRequest) -> anyhow::Result<()> {
         use p256::elliptic_curve::subtle::ConstantTimeEq;
         anyhow::ensure!(
-            self.channel_type == request.channel_type && self.client_id == request.client_id,
+            request.channel_type == 1 && self.client_id == request.client_id,
             "Bulk control identity differs from authenticated request"
         );
         anyhow::ensure!(

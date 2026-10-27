@@ -1,5 +1,7 @@
 pub mod account;
 pub mod advertisement;
+#[cfg(feature = "analytics")]
+pub mod analytics;
 #[cfg(feature = "clipboard")]
 pub mod auth_cli;
 #[cfg(feature = "clipboard")]
