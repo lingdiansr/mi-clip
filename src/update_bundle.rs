@@ -266,10 +266,6 @@ fn exchange(first: &Path, second: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "macos"))]
-fn exchange(_: &Path, _: &Path) -> anyhow::Result<()> {
-    anyhow::bail!("Application exchange requires macOS")
-}
 
 fn restart_previous(executable: &Path, arguments: &[std::ffi::OsString]) {
     let _ = Command::new(executable)
