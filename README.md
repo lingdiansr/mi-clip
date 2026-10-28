@@ -83,6 +83,22 @@ X11、其他 X11 会话和 GNOME 不在支持范围，程序不会回退到 X11 
 安装只写入当前用户的 `~/.local/bin` 与 `~/.local/share`，不使用 sudo、不设置开机自启、不修改 PATH；KDE 需要可执行位才会加载用户服务菜单，安装脚本会给服务菜单 0755。应用运行不依赖 Python，`install.py` 只用标准库。
 本地源码构建不伪造签名清单；Release 工作流用同一把 P-256 密钥签名 `mi-clip-linux-{arch}` 与 `manifest-linux-{arch}.json`，独立验签后把同一二进制和清单重新打包成 tar 并附 SHA-256。tar 只是桌面资源的分发载体，不参与自更新：自更新只替换用户安装的独立可执行文件，`~/.local/share` 下的入口保持不变。
 
+### Arch Linux（PKGBUILD）
+
+`linux/PKGBUILD` 可直接打包安装：
+
+    cd linux
+    makepkg -si
+
+只接受仓库 tarball 作为来源。首次打 tag 之前，先生成同名本地快照，makepkg 会优先使用它：
+
+    git archive --format=tar.gz --prefix=mi-clip-0.3.0/ \
+        -o linux/mi-clip-0.3.0.tar.gz HEAD
+
+正式发布后把 `$url/archive/v$pkgver.tar.gz` 作为来源，并执行 `updpkgsums` 用真实校验和替换 `SKIP`。
+打包使用独立 `CARGO_HOME`（`$srcdir/cargo-home`），不继承 `~/.cargo/config.toml` 的 linker/rustflags，
+因此在 `makedepends` 之外不需要 clang、mold 等工具。安装到 `/usr` 后自更新自动禁用，界面提示“请通过安装来源更新”。
+
 ### 发行依赖与 ABI
 
 发布二进制在 Ubuntu 24.04（x86_64 与 aarch64）上以 gnu/glibc 动态链接构建，不是 musl 静态包。

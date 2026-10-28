@@ -36,6 +36,7 @@
 !/linux/
 !/linux/*.desktop
 !/linux/*.svg
+!/linux/PKGBUILD
 
 !/macos/
 !/macos/*.swift

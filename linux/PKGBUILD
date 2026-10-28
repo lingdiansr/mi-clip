@@ -1,0 +1,74 @@
+# Maintainer: Mi Clip contributors
+#
+# Arch Linux 打包脚本（KDE Plasma Wayland / wlroots）。可用两种来源：
+#   1) 发布 tag：默认使用 $url/archive/v$pkgver.tar.gz；
+#   2) 本地快照：在首次打 tag 之前，把
+#        git archive --format=tar.gz --prefix=mi-clip-$pkgver/ -o mi-clip-$pkgver.tar.gz HEAD
+#      生成的同名 tarball 放在本目录，makepkg 会优先使用本地文件。
+#
+# 首次发布后请执行 `updpkgsums` 用真实校验和替换 SKIP。
+
+pkgname=mi-clip
+pkgver=0.3.0
+pkgrel=1
+pkgdesc='与小米手机同步剪贴板并接收文件的 Wayland 客户端'
+arch=('x86_64' 'aarch64')
+url='https://github.com/lingdiansr/mi-clip'
+# 仓库暂无 LICENSE 文件；补充后改为对应的 SPDX 标识。
+license=('unknown')
+depends=(
+  'glibc'
+  'gcc-libs'
+  'curl'
+  'libxkbcommon'
+  'vulkan-icd-loader'
+  'ca-certificates'
+)
+makedepends=('cargo' 'rust' 'pkgconf')
+optdepends=(
+  'plasma-workspace: KDE Plasma 状态托盘与桌面通知'
+  'dolphin: 文件管理器“发送到 Mi Clip”菜单'
+  'noto-fonts-cjk: 中文界面字体'
+)
+conflicts=('mi-clip-bin' 'mi-clip-git')
+# !lto：C 依赖（aws-lc-sys、wayland-backend 的 shim）在 makepkg 的 -flto=auto 下
+# 会变成 GCC LTO 位码，与 Rust 侧最终链接组合后出现未定义符号。
+# Rust 自身的 release LTO 由 Cargo.toml 控制，不受此处影响。
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  # 独立 CARGO_HOME：打包结果不依赖用户 ~/.cargo 的 linker/rustflags 配置，
+  # 也不需要用户额外安装 mold/clang。
+  export CARGO_HOME="$srcdir/cargo-home"
+  # 与 tools/build-release.sh 一致：去掉构建机路径，并显式停用自更新源。
+  # CARGO_ENCODED_RUSTFLAGS 会覆盖 makepkg 的 RUSTFLAGS（含 target-cpu=native），
+  # 因此打包产物不会绑定打包机的 CPU。
+  local sep=$'\x1f'
+  export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$PWD=/src${sep}--remap-path-prefix=$CARGO_HOME=/cargo"
+  export MI_CLIP_UPDATE_REPOSITORY=''
+  cargo build --release --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export CARGO_HOME="$srcdir/cargo-home"
+  # 只跑不需要合成器或网络的协议/更新测试；UI 测试需要真实 Wayland 会话。
+  cargo test --locked --no-default-features --lib
+  cargo test --locked --no-default-features --features research,analytics --lib
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/mi-clip "$pkgdir/usr/bin/mi-clip"
+  install -Dm644 linux/com.cyeam.miclip.desktop \
+    "$pkgdir/usr/share/applications/com.cyeam.miclip.desktop"
+  # 用户目录的服务菜单需要可执行位；系统目录不需要，保持 0644。
+  install -Dm644 linux/mi-clip-share.desktop \
+    "$pkgdir/usr/share/kio/servicemenus/mi-clip-share.desktop"
+  install -Dm644 linux/mi-clip.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/mi-clip.svg"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
