@@ -201,7 +201,10 @@ pub(super) fn cleanup(archive: &Path) {
     }
 }
 
-pub(super) fn install(pending: &PendingUpdate, arguments: &[String]) -> anyhow::Result<()> {
+pub(super) fn install(
+    pending: &PendingUpdate,
+    arguments: &[std::ffi::OsString],
+) -> anyhow::Result<()> {
     let mut transaction_started = false;
     let result = (|| {
         pending.validate()?;
@@ -268,7 +271,7 @@ fn exchange(_: &Path, _: &Path) -> anyhow::Result<()> {
     anyhow::bail!("Application exchange requires macOS")
 }
 
-fn restart_previous(executable: &Path, arguments: &[String]) {
+fn restart_previous(executable: &Path, arguments: &[std::ffi::OsString]) {
     let _ = Command::new(executable)
         .args(arguments)
         .env_remove("MICLIP_UPDATE_READY")
@@ -284,7 +287,7 @@ fn replace_and_launch(
     candidate: &Path,
     root: &Path,
     version: &str,
-    arguments: &[String],
+    arguments: &[std::ffi::OsString],
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let executable = destination.join("Contents/MacOS/mi-clip");

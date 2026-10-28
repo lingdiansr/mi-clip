@@ -34,6 +34,9 @@ pub(crate) struct Devices {
     pub scanning: bool,
     pub failed: bool,
     pub target: Option<SocketAddr>,
+    /// When the last successful discovery finished; the share picker refuses
+    /// stale catalogues instead of sending to an outdated address.
+    pub updated: Option<Instant>,
 }
 impl Devices {
     pub fn rows(&self, status: &str) -> Vec<(String, String)> {
@@ -82,9 +85,50 @@ impl Devices {
     }
 }
 
+/// Deterministic catalogue for the isolated Linux smoke harness.
+///
+/// Set `MICLIP_DEVICE_FIXTURE` to `address:port` to skip mDNS entirely; it never
+/// runs unless that variable is present.
+fn fixture_catalogue(value: &str) -> Option<Vec<Device>> {
+    let endpoint: SocketAddr = value.parse().ok()?;
+    if mi_clip::share_queue::validate_selected(endpoint).is_err() {
+        return None;
+    }
+    Some(vec![Device {
+        name: "测试手机".into(),
+        host: "fixture.local.".into(),
+        port: endpoint.port(),
+        device_type: 1,
+        addresses: vec![endpoint],
+    }])
+}
+
 pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSender<()> {
     let (request, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        if let Some(value) = std::env::var_os("MICLIP_DEVICE_FIXTURE")
+            && let Some(devices) = fixture_catalogue(&value.to_string_lossy())
+        {
+            let catalogue = devices
+                .iter()
+                .map(|device| mi_clip::share_queue::ShareDevice {
+                    name: device.name.clone(),
+                    device_type: device.device_type,
+                    endpoint: device.addresses[0],
+                })
+                .collect();
+            let _ = mi_clip::share_queue::publish_devices(catalogue);
+            while !stop.load(Ordering::Relaxed) {
+                let _ = events.send_blocking(TrayEvent::Discovering);
+                let _ = events.send_blocking(TrayEvent::Devices(Ok(devices.clone())));
+                match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => (),
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            return;
+        }
         let mut next_scan = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             if Instant::now() < next_scan && !mi_clip::share_queue::take_device_refresh() {

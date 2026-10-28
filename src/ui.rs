@@ -2,6 +2,8 @@ use gpui_rhai::gpui::{
     Context, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement,
     Styled, Subscription, Window, div, px, rgba,
 };
+#[cfg(not(target_os = "macos"))]
+use gpui_rhai::gpui::AnyElement;
 use gpui_rhai::{
     EmbeddedScriptSource, EmbeddedScriptView, ModuleId, PreparedScriptView, ScriptViewConfig,
     ScriptViewHandle, ScriptViewHost,
@@ -72,7 +74,9 @@ pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels
 pub struct Panel {
     host: ScriptViewHost,
     view: Result<ScriptViewHandle, String>,
-    _blur: Subscription,
+    /// macOS popups dismiss themselves when the app loses activation; a normal
+    /// Linux window must survive focus changes.
+    _blur: Option<Subscription>,
     _outside_click: OutsideClickMonitor,
     events: async_channel::Sender<crate::tray::TrayEvent>,
     pub(crate) update_label: String,
@@ -81,6 +85,7 @@ pub struct Panel {
     status: String,
 }
 impl Panel {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn device_count(&self) -> usize {
         self.devices.entries.len()
     }
@@ -121,10 +126,13 @@ impl Panel {
         Ok(())
     }
     pub fn validate(&self, cx: &gpui_rhai::gpui::App) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
         anyhow::ensure!(
             self._outside_click.0.is_some(),
             "Outside click monitor unavailable"
         );
+        #[cfg(not(target_os = "macos"))]
+        let _ = &self._outside_click;
         let view = self
             .view
             .as_ref()
@@ -160,11 +168,14 @@ impl Panel {
             let _ = view.focus(window, cx);
         }
         let outside_click = OutsideClickMonitor::new(events.clone());
-        let blur = cx.observe_window_activation(window, |_, window, _| {
+        #[cfg(target_os = "macos")]
+        let blur = Some(cx.observe_window_activation(window, |_, window, _| {
             if !window.is_window_active() {
                 window.remove_window();
             }
-        });
+        }));
+        #[cfg(not(target_os = "macos"))]
+        let blur = None;
         Self {
             host,
             view,
@@ -181,7 +192,9 @@ impl Panel {
 // AppKit popup panels can remain nonactivating, so a key-window change alone
 // does not reliably detect clicks in other apps. Monitor mouse-down only while
 // this popup exists; no polling, keyboard capture or accessibility permission.
+#[cfg(target_os = "macos")]
 struct OutsideClickMonitor(Option<objc2::rc::Retained<objc2::runtime::AnyObject>>);
+#[cfg(target_os = "macos")]
 impl OutsideClickMonitor {
     fn new(events: async_channel::Sender<crate::tray::TrayEvent>) -> Self {
         use objc2_app_kit::{NSEvent, NSEventMask};
@@ -194,6 +207,7 @@ impl OutsideClickMonitor {
         ))
     }
 }
+#[cfg(target_os = "macos")]
 impl Drop for OutsideClickMonitor {
     fn drop(&mut self) {
         if let Some(monitor) = self.0.take() {
@@ -205,6 +219,16 @@ impl Drop for OutsideClickMonitor {
         }
     }
 }
+/// Linux keeps the status window open when focus moves elsewhere.
+#[cfg(not(target_os = "macos"))]
+struct OutsideClickMonitor;
+#[cfg(not(target_os = "macos"))]
+impl OutsideClickMonitor {
+    fn new(_events: async_channel::Sender<crate::tray::TrayEvent>) -> Self {
+        Self
+    }
+}
+
 impl Render for Panel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let checking = self.update_label == "检查中…" || self.update_label.starts_with("正在下载 ");
@@ -253,6 +277,23 @@ impl Render for Panel {
                 },
             ));
         }
+        // macOS offers the Share extension; Linux has no equivalent entry point.
+        #[cfg(target_os = "macos")]
+        let setup_row = Some(
+            div()
+                .id("share-setup")
+                .h(px(28.0))
+                .flex_shrink_0()
+                .px(px(14.0))
+                .text_size(px(10.0))
+                .text_color(rgba(0xa4acbaff))
+                .cursor_pointer()
+                .on_click(|_, _, _| crate::sharing_setup::open_help())
+                .child(crate::sharing_setup::hint())
+                .into_any_element(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let setup_row: Option<AnyElement> = None;
         let has_phone = self.devices.entries.iter().any(|d| d.device_type == 1);
         let discovery_note = if self.devices.failed {
             "发现失败 · 列表为上次结果"
@@ -339,18 +380,7 @@ impl Render for Panel {
                                 .child("退出"),
                         ),
                 )
-                .child(
-                    div()
-                        .id("share-setup")
-                        .h(px(28.0))
-                        .flex_shrink_0()
-                        .px(px(14.0))
-                        .text_size(px(10.0))
-                        .text_color(rgba(0xa4acbaff))
-                        .cursor_pointer()
-                        .on_click(|_, _, _| crate::sharing_setup::open_help())
-                        .child(crate::sharing_setup::hint()),
-                )
+                .children(setup_row)
                 .child(
                     div()
                         .h(px(232.0))

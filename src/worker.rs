@@ -10,7 +10,12 @@ use std::{
     time::Duration,
 };
 
-pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) {
+/// Runs the synchronisation loop until `stop` is set.
+pub fn start(
+    config: PathBuf,
+    events: Sender<TrayEvent>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut backoff = 2;
         let mut last_error = String::new();
@@ -20,6 +25,9 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             let _ = events.try_send(TrayEvent::Status("连接中", last_error.clone()));
             let connected = std::cell::Cell::new(false);
             let attempted = std::cell::Cell::new(None);
+            // Capture the outstanding share task before the session starts, so a
+            // late error can never settle a newer request.
+            let failure_scope = mi_clip::share_queue::failure_scope();
             let phase = std::cell::Cell::new("发现设备／读取配置");
             let result = handshake::sync_once(&config, &stop, &|event| {
                 if let Some(event) = analytics.borrow_mut().observe(&event) {
@@ -107,8 +115,8 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             last_error = match result {
                 Err(error) => {
                     let detail = format!("{}失败：{error:#}", phase.get());
-                    if let Some(target) = attempted.get() {
-                        mi_clip::share_queue::fail_pending(target, &detail);
+                    if let Some(scope) = &failure_scope {
+                        scope.fail_if_pending(&detail);
                     }
                     let timestamp = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -138,7 +146,7 @@ pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) 
             }
             backoff = if selected { 2 } else { (backoff * 2).min(30) };
         }
-    });
+    })
 }
 
 fn switch_target(
@@ -170,7 +178,7 @@ mod tests {
             .join(format!("mi-clip-missing-{}", std::process::id()))
             .join("config.json");
         assert!(!missing.exists());
-        start(missing, events, stop.clone());
+        let worker = start(missing, events, stop.clone());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut failure = None;
         let mut retained = false;
@@ -189,6 +197,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
         assert!(failure.is_some(), "connection error was not reported");
         assert!(retained, "retry cleared the previous connection error");
     }

@@ -789,32 +789,30 @@ fn exchange(
                 && share_scan.elapsed() >= Duration::from_millis(500)
             {
                 share_scan = Instant::now();
-                if let Some(root) = crate::share_queue::root() {
-                    match crate::share_queue::Request::next_for(&root, Some(config.endpoint)) {
-                        Ok(Some(request)) => {
-                            let sender = crate::share_sender::Sender::new(request)?;
-                            let signing = p256::ecdsa::SigningKey::from_slice(
-                                &base64::engine::general_purpose::STANDARD
-                                    .decode(&identity.private_key)?,
-                            )?;
-                            let inner = crate::file_channel::sync_reply_for_service(
-                                active_key.as_ref().unwrap(),
-                                &signing,
-                                &session.user_id,
-                                crate::file_channel::PHONE_SHARE_SERVICE,
-                            )?;
-                            let mut logical = integer(1, 2);
-                            logical.extend(integer(3, sender.nonce.into()));
-                            logical.extend(message(5, &inner));
-                            transport.send(&frame(17, &message(2, &message(1, &logical)))?)?;
-                            outgoing = Some(sender);
-                            on_event(SyncEvent::ShareStarted);
-                        }
-                        Err(error) => {
-                            eprintln!("Mi Clip share request rejected: {error:#}");
-                        }
-                        Ok(None) => (),
+                match crate::share_queue::take_for(config.endpoint) {
+                    Ok(Some(request)) => {
+                        let sender = crate::share_sender::Sender::new(request)?;
+                        let signing = p256::ecdsa::SigningKey::from_slice(
+                            &base64::engine::general_purpose::STANDARD
+                                .decode(&identity.private_key)?,
+                        )?;
+                        let inner = crate::file_channel::sync_reply_for_service(
+                            active_key.as_ref().unwrap(),
+                            &signing,
+                            &session.user_id,
+                            crate::file_channel::PHONE_SHARE_SERVICE,
+                        )?;
+                        let mut logical = integer(1, 2);
+                        logical.extend(integer(3, sender.nonce.into()));
+                        logical.extend(message(5, &inner));
+                        transport.send(&frame(17, &message(2, &message(1, &logical)))?)?;
+                        outgoing = Some(sender);
+                        on_event(SyncEvent::ShareStarted);
                     }
+                    Err(error) => {
+                        eprintln!("Mi Clip share request rejected: {error:#}");
+                    }
+                    Ok(None) => (),
                 }
             }
         }

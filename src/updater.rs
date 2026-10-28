@@ -1,6 +1,18 @@
-//! Signed, bounded application and legacy executable updates.
+//! Signed, bounded application and executable updates.
+//!
+//! macOS accepts a raw executable or an application archive; Linux accepts only
+//! a raw ELF executable. The application-bundle tooling is not compiled on Linux.
+#[cfg(target_os = "macos")]
 #[path = "update_bundle.rs"]
 mod bundle;
+#[cfg(target_os = "macos")]
+use bundle::app_root;
+
+/// Linux never runs a macOS application bundle.
+#[cfg(not(target_os = "macos"))]
+fn app_root(_: &Path) -> Option<&Path> {
+    None
+}
 use crate::{http, private, update_key};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use p256::ecdsa::{
@@ -25,31 +37,37 @@ const MAX_APP: usize = 128 * 1024 * 1024;
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Artifact {
+    /// Legacy macOS raw executable; the field is omitted for these feeds.
     #[default]
     Binary,
     AppZip,
+    /// Linux raw ELF executable; always named explicitly in its manifest.
+    LinuxBinary,
 }
 impl Artifact {
+    /// Only the legacy macOS executable feeds omit the kind field.
     fn is_binary(&self) -> bool {
         *self == Self::Binary
     }
     fn limit(self) -> usize {
-        if self == Self::Binary {
-            MAX_BINARY
-        } else {
+        if self == Self::AppZip {
             MAX_APP
+        } else {
+            MAX_BINARY
         }
     }
     fn manifest(self, arch: &str) -> String {
         match self {
             Self::Binary => format!("manifest-macos-{arch}.json"),
             Self::AppZip => format!("manifest-app-macos-{arch}.json"),
+            Self::LinuxBinary => format!("manifest-linux-{arch}.json"),
         }
     }
     fn asset(self, arch: &str) -> String {
         match self {
             Self::Binary => asset(arch),
             Self::AppZip => format!("Clip-macos-{arch}.zip"),
+            Self::LinuxBinary => format!("mi-clip-linux-{arch}"),
         }
     }
 }
@@ -145,11 +163,16 @@ fn verify_feed(
 }
 fn verify_binary(bytes: &[u8], release: &Release) -> anyhow::Result<()> {
     anyhow::ensure!(
-        release.kind == Artifact::Binary,
+        matches!(release.kind, Artifact::Binary | Artifact::LinuxBinary),
         "Expected an executable update"
     );
+    // The digest covers the exact bytes that are validated below.
     verify_digest(bytes, release)?;
-    verify_macho(bytes, &release.arch)
+    match release.kind {
+        Artifact::Binary => verify_macho(bytes, &release.arch),
+        Artifact::LinuxBinary => verify_elf(bytes, &release.arch),
+        Artifact::AppZip => unreachable!(),
+    }
 }
 fn verify_digest(bytes: &[u8], release: &Release) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -178,6 +201,86 @@ fn verify_macho(bytes: &[u8], arch: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Accepts only a complete little-endian ELF64 executable with an entry point
+/// inside an executable loadable segment.
+fn verify_elf(bytes: &[u8], arch: &str) -> anyhow::Result<()> {
+    const HEADER: usize = 64;
+    const PROGRAM_HEADER: usize = 56;
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1;
+    let machine = match arch {
+        "x86_64" => 62u16,
+        "aarch64" => 183,
+        _ => anyhow::bail!("Unsupported update architecture"),
+    };
+    anyhow::ensure!(
+        bytes.len() >= HEADER
+            && bytes.get(..4) == Some(b"\x7fELF".as_slice())
+            // 64-bit, little endian, current version.
+            && bytes[4] == 2
+            && bytes[5] == 1
+            && bytes[6] == 1,
+        "Update is not a 64-bit little-endian ELF executable"
+    );
+    let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    let dword = |offset: usize| {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    };
+    let qword = |offset: usize| {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    };
+    // ET_EXEC or ET_DYN, matching machine and version.
+    anyhow::ensure!(
+        matches!(word(16), 2 | 3) && word(18) == machine && dword(20) == 1,
+        "Update is not an executable for this architecture"
+    );
+    let entry = qword(24);
+    let phoff = qword(32);
+    let phentsize = u64::from(word(54));
+    let phnum = u64::from(word(56));
+    anyhow::ensure!(
+        word(52) as u64 == HEADER as u64
+            && phentsize == PROGRAM_HEADER as u64
+            && phnum != 0
+            && phoff >= HEADER as u64,
+        "Update has an incomplete ELF header"
+    );
+    let table_end = phoff
+        .checked_add(phnum.checked_mul(phentsize).ok_or_else(|| {
+            anyhow::anyhow!("Update has an oversized ELF program header table")
+        })?)
+        .ok_or_else(|| anyhow::anyhow!("Update has an oversized ELF program header table"))?;
+    anyhow::ensure!(
+        table_end <= bytes.len() as u64,
+        "Update has a truncated ELF program header table"
+    );
+    let mut entry_segment = false;
+    for index in 0..phnum {
+        let base = (phoff + index * phentsize) as usize;
+        if dword(base) != PT_LOAD || dword(base + 4) & PF_X == 0 {
+            continue;
+        }
+        let offset = qword(base + 8);
+        let filesz = qword(base + 24);
+        let memsz = qword(base + 32);
+        anyhow::ensure!(
+            offset
+                .checked_add(filesz)
+                .is_some_and(|end| end <= bytes.len() as u64),
+            "Update has a truncated ELF segment"
+        );
+        let vaddr = qword(base + 16);
+        if vaddr <= entry && entry < vaddr.saturating_add(memsz) {
+            entry_segment = true;
+        }
+    }
+    anyhow::ensure!(
+        entry != 0 && entry_segment,
+        "Update entry point is outside every executable ELF segment"
+    );
+    Ok(())
+}
+
 pub struct PendingUpdate {
     release: Release,
     staged: PathBuf,
@@ -190,19 +293,28 @@ impl PendingUpdate {
     pub fn validate(&self) -> anyhow::Result<()> {
         let bytes = fs::read(&self.staged)?;
         match self.release.kind {
-            Artifact::Binary => verify_binary(&bytes, &self.release),
-            Artifact::AppZip => bundle::verify_archive(&bytes, &self.release),
+            Artifact::Binary | Artifact::LinuxBinary => verify_binary(&bytes, &self.release),
+            Artifact::AppZip => {
+                #[cfg(target_os = "macos")]
+                {
+                    bundle::verify_archive(&bytes, &self.release)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    anyhow::bail!("Application archives are macOS-only")
+                }
+            }
         }
     }
 }
 impl Drop for PendingUpdate {
     fn drop(&mut self) {
-        match self.release.kind {
-            Artifact::Binary => {
-                let _ = fs::remove_file(&self.staged);
-            }
-            Artifact::AppZip => bundle::cleanup(&self.staged),
+        if matches!(self.release.kind, Artifact::Binary | Artifact::LinuxBinary) {
+            let _ = fs::remove_file(&self.staged);
+            return;
         }
+        #[cfg(target_os = "macos")]
+        bundle::cleanup(&self.staged);
     }
 }
 pub enum Check {
@@ -211,10 +323,84 @@ pub enum Check {
     Ready(PendingUpdate),
 }
 
+/// Whether this installation may replace its own executable.
+///
+/// Package-managed locations are updated by their package manager, never by the
+/// process itself; a standalone build in a user-writable directory may.
+pub fn can_self_update() -> bool {
+    std::env::current_exe().is_ok_and(|executable| self_update_allowed(&executable))
+}
+
+#[cfg(target_os = "macos")]
+fn self_update_allowed(_: &Path) -> bool {
+    true
+}
+
+/// Only a user-owned regular executable in a writable, non-managed directory.
+#[cfg(target_os = "linux")]
+fn self_update_allowed(executable: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = fs::metadata(executable) else {
+        return false;
+    };
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file() || metadata.uid() != uid {
+        return false;
+    }
+    let Some(parent) = executable.parent() else {
+        return false;
+    };
+    let Ok(parent_metadata) = fs::metadata(parent) else {
+        return false;
+    };
+    if parent_metadata.uid() != uid {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
+        return false;
+    };
+    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } != 0 {
+        return false;
+    }
+    let path = executable.to_string_lossy();
+    !["/usr/", "/opt/", "/nix/store/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 pub fn bundled() -> bool {
-    std::env::current_exe()
-        .ok()
-        .is_some_and(|path| bundle::app_root(&path).is_some())
+    std::env::current_exe().is_ok_and(|path| app_root(&path).is_some())
+}
+
+/// The artifact kind this platform installs.
+fn platform_kind(executable: &Path) -> Artifact {
+    #[cfg(target_os = "macos")]
+    {
+        if app_root(executable).is_some() {
+            Artifact::AppZip
+        } else {
+            Artifact::Binary
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = executable;
+        Artifact::LinuxBinary
+    }
+}
+
+/// The raw executable kind this platform signs.
+fn platform_binary_kind() -> Artifact {
+    #[cfg(target_os = "macos")]
+    {
+        Artifact::Binary
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Artifact::LinuxBinary
+    }
 }
 
 pub fn check() -> anyhow::Result<Check> {
@@ -223,21 +409,22 @@ pub fn check() -> anyhow::Result<Check> {
 
 pub fn check_with_progress(mut downloading: impl FnMut(&str)) -> anyhow::Result<Check> {
     anyhow::ensure!(repository(REPOSITORY), "Update repository not configured");
+    anyhow::ensure!(
+        self_update_allowed(&std::env::current_exe()?),
+        "此安装位置不支持自更新，请通过安装来源更新"
+    );
     let arch = std::env::consts::ARCH;
     let executable = std::env::current_exe()?.canonicalize()?;
-    let kind = if bundle::app_root(&executable).is_some() {
-        Artifact::AppZip
-    } else {
-        Artifact::Binary
-    };
+    let kind = platform_kind(&executable);
     let url = format!(
         "https://github.com/{REPOSITORY}/releases/latest/download/{}",
         kind.manifest(arch)
     );
     let response = http::download(&url, 65536)?;
     if response.status == 404 {
-        // Old releases only have executable manifests. They can establish
+        // Old macOS releases only have executable manifests. They can establish
         // "current", but can never authorize an unsigned application archive.
+        #[cfg(target_os = "macos")]
         if kind == Artifact::AppZip {
             let legacy = http::download(
                 &format!(
@@ -269,6 +456,7 @@ pub fn check_with_progress(mut downloading: impl FnMut(&str)) -> anyhow::Result<
     downloading(&release.version);
     let response = http::download(&release.url, release.size)?;
     anyhow::ensure!(response.status == 200, "Update download failed");
+    #[cfg(target_os = "macos")]
     if kind == Artifact::AppZip {
         let staged = bundle::prepare(&response.body, &release, &executable)?;
         return Ok(Check::Ready(PendingUpdate {
@@ -299,7 +487,7 @@ fn health_file(executable: &Path) -> anyhow::Result<PathBuf> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let parent = bundle::app_root(executable)
+    let parent = app_root(executable)
         .and_then(|p| p.parent())
         .or_else(|| executable.parent());
     Ok(parent
@@ -315,7 +503,7 @@ pub fn mark_ready() -> anyhow::Result<()> {
     let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
     anyhow::ensure!(
         path.parent()
-            == bundle::app_root(&executable)
+            == app_root(&executable)
                 .and_then(|p| p.parent())
                 .or_else(|| executable.parent())
             && name.starts_with(".mi-clip-health-")
@@ -330,13 +518,23 @@ pub fn mark_ready() -> anyhow::Result<()> {
 
 /// Called during application shutdown after the instance lock is released.
 /// Preserve the old inode until the replacement reports a functioning status bar.
-pub fn install(pending: PendingUpdate, arguments: &[String]) -> anyhow::Result<()> {
+pub fn install(pending: PendingUpdate, arguments: &[std::ffi::OsString]) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
+    anyhow::ensure!(
+        self_update_allowed(&pending.executable),
+        "此安装位置不支持自更新，请通过安装来源更新"
+    );
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        pending.release.kind == Artifact::LinuxBinary,
+        "更新类型与当前平台不符"
+    );
+    #[cfg(target_os = "macos")]
     if pending.release.kind == Artifact::AppZip {
         return bundle::install(&pending, arguments);
     }
     anyhow::ensure!(
-        bundle::app_root(&pending.executable).is_none(),
+        app_root(&pending.executable).is_none(),
         "Executable updates cannot modify an application bundle"
     );
     let backup = health_file(&pending.executable)?.with_extension("previous");
@@ -410,7 +608,12 @@ pub fn sign_release(config: &Path, output: &Path) -> anyhow::Result<()> {
             == STANDARD.decode(update_key::PUBLIC_KEY)?,
         "Signing key does not match this project's public key"
     );
-    let mut artifacts = vec![(Artifact::Binary, fs::read(&config.binary)?)];
+    #[cfg(target_os = "linux")]
+    anyhow::ensure!(
+        config.app_archive.is_none(),
+        "Linux releases have a single binary asset"
+    );
+    let mut artifacts = vec![(platform_binary_kind(), fs::read(&config.binary)?)];
     if let Some(path) = config.app_archive {
         artifacts.push((Artifact::AppZip, fs::read(path)?));
     }
@@ -428,8 +631,13 @@ pub fn sign_release(config: &Path, output: &Path) -> anyhow::Result<()> {
         };
         release.url = release_url(&config.repository, &release);
         match kind {
-            Artifact::Binary => verify_binary(&bytes, &release)?,
-            Artifact::AppZip => bundle::verify_archive(&bytes, &release)?,
+            Artifact::Binary | Artifact::LinuxBinary => verify_binary(&bytes, &release)?,
+            Artifact::AppZip => {
+                #[cfg(target_os = "macos")]
+                bundle::verify_archive(&bytes, &release)?;
+                #[cfg(not(target_os = "macos"))]
+                anyhow::bail!("Application archives are macOS-only");
+            }
         }
         let payload = serde_json::to_vec(&release)?;
         let signature: Signature = signing.sign(&payload);
@@ -446,7 +654,7 @@ pub fn sign_release(config: &Path, output: &Path) -> anyhow::Result<()> {
         )?;
         let artifact = output.join(kind.asset(&release.arch));
         private::save(&artifact, &bytes)?;
-        if kind == Artifact::Binary {
+        if matches!(kind, Artifact::Binary | Artifact::LinuxBinary) {
             fs::set_permissions(artifact, fs::Permissions::from_mode(0o755))?;
         }
         private::save(&output.join(kind.manifest(&release.arch)), &manifest)?;
@@ -458,24 +666,66 @@ pub fn sign_release(config: &Path, output: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (SigningKey, Release, Vec<u8>) {
-        let key = SigningKey::from_slice(&[7; 32]).unwrap();
-        let mut binary = vec![0; 64];
-        binary[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
-        binary[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
-        binary[12..16].copy_from_slice(&2u32.to_le_bytes());
+    /// A minimal ELF64 executable: one executable PT_LOAD covering the entry.
+    fn elf_fixture() -> Vec<u8> {
+        const TOTAL: usize = 64 + 56;
+        let mut bytes = vec![0u8; TOTAL];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // little endian
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x400600u64.to_le_bytes()); // inside the segment
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes()); // phnum
+        let program = 64;
+        bytes[program..program + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        bytes[program + 4..program + 8].copy_from_slice(&5u32.to_le_bytes()); // R|X
+        bytes[program + 8..program + 16].copy_from_slice(&0u64.to_le_bytes());
+        bytes[program + 16..program + 24]
+            .copy_from_slice(&0x400000u64.to_le_bytes()); // vaddr
+        bytes[program + 24..program + 32]
+            .copy_from_slice(&(TOTAL as u64).to_le_bytes()); // filesz
+        bytes[program + 32..program + 40]
+            .copy_from_slice(&0x1000u64.to_le_bytes()); // memsz
+        bytes[program + 40..program + 48]
+            .copy_from_slice(&0x1000u64.to_le_bytes()); // align
+        bytes
+    }
+
+    fn release_for(kind: Artifact, arch: &str, binary: &[u8]) -> Release {
         let mut release = Release {
-            kind: Artifact::Binary,
+            kind,
             version: "1.2.3".into(),
-            arch: "x86_64".into(),
+            arch: arch.into(),
             size: binary.len(),
-            sha256: Sha256::digest(&binary)
+            sha256: Sha256::digest(binary)
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect(),
             url: String::new(),
         };
         release.url = release_url("example/clipboard", &release);
+        release
+    }
+
+    fn fixture() -> (SigningKey, Release, Vec<u8>) {
+        let key = SigningKey::from_slice(&[7; 32]).unwrap();
+        #[cfg(target_os = "macos")]
+        let binary = {
+            let mut binary = vec![0; 64];
+            binary[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+            binary[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+            binary[12..16].copy_from_slice(&2u32.to_le_bytes());
+            binary
+        };
+        #[cfg(target_os = "linux")]
+        let binary = elf_fixture();
+        let release = release_for(platform_binary_kind(), "x86_64", &binary);
         (key, release, binary)
     }
     fn signed(key: &SigningKey, release: &Release) -> Vec<u8> {
@@ -547,8 +797,11 @@ mod tests {
     #[test]
     fn signed_app_feed_binds_archive_type_url_and_digest_without_changing_legacy_feeds() {
         let (key, mut release, binary) = fixture();
-        let legacy = serde_json::to_value(&release).unwrap();
-        assert!(legacy.get("kind").is_none());
+        let serialized = serde_json::to_value(&release).unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(serialized.get("kind").is_none());
+        #[cfg(target_os = "linux")]
+        assert_eq!(serialized["kind"], "linux_binary");
         release.kind = Artifact::AppZip;
         release.url = release_url("example/clipboard", &release);
         assert!(release.url.ends_with("/Clip-macos-x86_64.zip"));
@@ -624,7 +877,7 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         private::save(&staged, &binary).unwrap();
         let release = Release {
-            kind: Artifact::Binary,
+            kind: platform_binary_kind(),
             version: env!("CARGO_PKG_VERSION").into(),
             arch: std::env::consts::ARCH.into(),
             size: binary.len(),
@@ -646,6 +899,69 @@ mod tests {
         assert_eq!(fs::read(target).unwrap(), binary);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         std::thread::sleep(std::time::Duration::from_secs(4));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linux_elf_updates_reject_mach_o_zip_truncation_and_other_architectures() {
+        let elf = elf_fixture();
+        let release = release_for(Artifact::LinuxBinary, "x86_64", &elf);
+        assert!(verify_binary(&elf, &release).is_ok());
+        // The same bytes under the legacy macOS kind are not a Mach-O image.
+        let legacy = release_for(Artifact::Binary, "x86_64", &elf);
+        assert!(verify_binary(&elf, &legacy).is_err());
+        // Mach-O and ZIP payloads are refused for Linux manifests.
+        let mut macho = elf.clone();
+        macho[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        let macho_release = release_for(Artifact::LinuxBinary, "x86_64", &macho);
+        assert!(verify_binary(&macho, &macho_release).is_err());
+        let zip = b"PK\x03\x04not-an-executable";
+        let zip_release = release_for(Artifact::LinuxBinary, "x86_64", zip);
+        assert!(verify_binary(zip, &zip_release).is_err());
+        // A truncated program header table or segment is rejected.
+        let mut truncated = elf.clone();
+        truncated.truncate(90);
+        let truncated_release = release_for(Artifact::LinuxBinary, "x86_64", &truncated);
+        assert!(verify_binary(&truncated, &truncated_release).is_err());
+        // Wrong architecture in either the manifest or the ELF header.
+        let aarch64 = release_for(Artifact::LinuxBinary, "aarch64", &elf);
+        assert!(verify_binary(&elf, &aarch64).is_err());
+        // A shared object has no entry point.
+        let mut shared = elf.clone();
+        shared[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        shared[24..32].copy_from_slice(&0u64.to_le_bytes());
+        let shared_release = release_for(Artifact::LinuxBinary, "x86_64", &shared);
+        assert!(verify_binary(&shared, &shared_release).is_err());
+        // An entry outside every executable segment is refused.
+        let mut outside = elf.clone();
+        outside[24..32].copy_from_slice(&0x9000u64.to_le_bytes());
+        let outside_release = release_for(Artifact::LinuxBinary, "x86_64", &outside);
+        assert!(verify_binary(&outside, &outside_release).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_user_owned_standalone_executables_may_self_update() {
+        let root = std::env::temp_dir().join(format!(
+            "miclip-self-update-{:016x}",
+            u64::from_ne_bytes(private::random().unwrap())
+        ));
+        fs::create_dir(&root).unwrap();
+        let executable = root.join("mi-clip");
+        fs::write(&executable, b"synthetic executable").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(self_update_allowed(&executable));
+        // A directory, a managed prefix, and a foreign owner are refused.
+        assert!(!self_update_allowed(&root));
+        assert!(!self_update_allowed(Path::new("/usr/bin/true")));
+        assert!(!self_update_allowed(Path::new("/usr/local/bin/mi-clip")));
+        // An unwritable parent directory refuses replacement. Root always may
+        // write, so this check only applies to unprivileged test runs.
+        if unsafe { libc::getuid() } != 0 {
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+            assert!(!self_update_allowed(&executable));
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

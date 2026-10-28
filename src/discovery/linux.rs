@@ -30,7 +30,7 @@ impl Drop for Daemon {
 pub(super) fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
     let daemon =
         ServiceDaemon::new().map_err(|error| anyhow::anyhow!("mDNS 守护线程启动失败：{error}"))?;
-    let mut guard = Daemon(Some(daemon));
+    let guard = Daemon(Some(daemon));
     let daemon = guard.0.as_ref().unwrap();
     let events = daemon
         .browse(SERVICE)

@@ -492,30 +492,97 @@ mod tests {
         assert!(accept_response(&[0x08, 0x02], b"task-one").is_err());
     }
 
-    fn setup() -> (std::path::PathBuf, Sender) {
+    /// Each test owns its own queue, so parallel tests never share a slot.
+    struct Fixture {
+        root: std::path::PathBuf,
+        #[cfg(target_os = "linux")]
+        share: Option<crate::share_queue::LocalShare>,
+    }
+    impl Fixture {
+        fn request_directory(&self) -> std::path::PathBuf {
+            self.root.join("outbox/test.ready")
+        }
+        fn status_completed(&self) -> bool {
+            #[cfg(target_os = "macos")]
+            {
+                let status: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(self.request_directory().join("status.json")).unwrap(),
+                )
+                .unwrap();
+                status["state"] == "completed"
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.share.as_ref().is_some_and(|share| {
+                    share.snapshot().state == crate::share_queue::ShareState::Completed
+                })
+            }
+        }
+        fn cancel(&mut self) {
+            #[cfg(target_os = "macos")]
+            {
+                std::fs::remove_dir_all(self.request_directory()).unwrap();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(share) = self.share.take() {
+                    share.cancel();
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn setup() -> (Fixture, Sender) {
         let root = std::env::temp_dir().join(format!(
             "clip-share-test-{:016x}",
             u64::from_ne_bytes(crate::private::random().unwrap())
         ));
-        let directory = root.join("outbox/test.ready");
-        std::fs::create_dir_all(directory.join("files")).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(directory.join("files/sample.txt"), vec![0x42; 70_001]).unwrap();
-        std::fs::write(directory.join("files/empty.bin"), b"").unwrap();
-        std::fs::write(
-            directory.join("request.json"),
-            br#"{"files":["sample.txt","empty.bin"],"target":"127.0.0.1:1"}"#,
-        )
-        .unwrap();
-        let request = crate::share_queue::Request::next(&root.join("outbox"))
-            .unwrap()
+        std::fs::create_dir_all(&root).unwrap();
+        let target = "127.0.0.1:1".parse().unwrap();
+        #[cfg(target_os = "macos")]
+        let request = {
+            let directory = root.join("outbox/test.ready");
+            std::fs::create_dir_all(directory.join("files")).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(directory.join("files/sample.txt"), vec![0x42; 70_001]).unwrap();
+            std::fs::write(directory.join("files/empty.bin"), b"").unwrap();
+            std::fs::write(
+                directory.join("request.json"),
+                br#"{"files":["sample.txt","empty.bin"],"target":"127.0.0.1:1"}"#,
+            )
             .unwrap();
-        (root, Sender::new(request).unwrap())
+            crate::share_queue::Request::next(&root.join("outbox"))
+                .unwrap()
+                .unwrap()
+        };
+        #[cfg(target_os = "linux")]
+        let (request, share) = {
+            let sample = root.join("sample.txt");
+            let empty = root.join("empty.bin");
+            std::fs::write(&sample, vec![0x42; 70_001]).unwrap();
+            std::fs::write(&empty, b"").unwrap();
+            let queue = std::sync::Arc::new(crate::share_queue::Queue::new());
+            let share = queue.enqueue(vec![sample, empty], target).unwrap();
+            let request = queue.take_for(target).unwrap();
+            (request, share)
+        };
+        (
+            Fixture {
+                root,
+                #[cfg(target_os = "linux")]
+                share: Some(share),
+            },
+            Sender::new(request).unwrap(),
+        )
     }
     #[test]
     fn logical_share_request_contains_express_link_and_wifi_medium() {
         use base64::Engine;
-        let (root, sender) = setup();
+        let (fixture, sender) = setup();
         let request = sender.logical_request();
         let body = bytes(&request, 2).unwrap();
         assert_eq!(number(body, 1).unwrap(), 1);
@@ -539,19 +606,19 @@ mod tests {
             ]
         );
         drop(sender);
-        std::fs::remove_dir_all(root).unwrap();
+        drop(fixture);
     }
 
     #[test]
     fn direct_share_saves_multiple_files_and_waits_for_receiver_confirmation() {
-        let (root, mut sender) = setup();
+        let (fixture, mut sender) = setup();
         let local = "127.0.0.1".parse().unwrap();
         let mut receiver = crate::file_channel::FileReceiver::open(
             local,
             local,
             None,
             sender.key,
-            Some(&root.join("downloads")),
+            Some(&fixture.root.join("downloads")),
         )
         .unwrap();
         let port_request = sender.port_request().unwrap();
@@ -574,7 +641,7 @@ mod tests {
             )
             .unwrap();
         assert!(!sender.poll().unwrap());
-        assert!(!root.join("downloads/sample.txt").exists());
+        assert!(!fixture.root.join("downloads/sample.txt").exists());
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             receiver.poll().unwrap();
@@ -585,27 +652,23 @@ mod tests {
         }
         assert!(sender.complete, "share did not receive completion");
         assert_eq!(
-            std::fs::read(root.join("downloads/sample.txt")).unwrap(),
+            std::fs::read(fixture.root.join("downloads/sample.txt")).unwrap(),
             vec![0x42; 70_001]
         );
         assert_eq!(
-            std::fs::metadata(root.join("downloads/empty.bin"))
+            std::fs::metadata(fixture.root.join("downloads/empty.bin"))
                 .unwrap()
                 .len(),
             0
         );
-        let state: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root.join("outbox/test.ready/status.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(state["state"], "completed");
+        assert!(fixture.status_completed(), "completion was not published");
         drop(sender);
         drop(receiver);
-        std::fs::remove_dir_all(root).unwrap();
+        drop(fixture);
     }
     #[test]
     fn cancellation_and_premature_success_do_not_report_completion() {
-        let (root, mut sender) = setup();
+        let (mut fixture, mut sender) = setup();
         let mut message = wire::integer(1, 8);
         message.extend(wire::message(2, &wire::integer(1, 1)));
         let complete = ft::byte_message(0, &message).unwrap();
@@ -615,15 +678,15 @@ mod tests {
                 .is_err()
         );
         assert!(!sender.complete);
-        std::fs::remove_dir_all(root.join("outbox/test.ready")).unwrap();
+        fixture.cancel();
         assert!(sender.poll().is_err());
         drop(sender);
-        std::fs::remove_dir_all(root).unwrap();
+        drop(fixture);
     }
 
     #[test]
     fn saved_stream_receipt_waits_for_task_completion_and_rejects_failure() {
-        let (root, mut sender) = setup();
+        let (fixture, mut sender) = setup();
         let receipt = |code: i32, id: u32| {
             let mut body = ft::tlv(3, 0, &0u32.to_be_bytes()).unwrap();
             body.extend(ft::tlv(3, 1, &id.to_be_bytes()).unwrap());
@@ -642,6 +705,6 @@ mod tests {
         assert!(sender.receive(&failure).is_err());
         assert!(sender.receive(&unknown).is_err());
         drop(sender);
-        std::fs::remove_dir_all(root).unwrap();
+        drop(fixture);
     }
 }

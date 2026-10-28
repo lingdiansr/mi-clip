@@ -16,10 +16,29 @@ pub enum Notice {
     Current,
     Unpublished,
     Failed,
+    /// This installation must be updated by the tool that installed it.
+    NotInstallable,
     Ready(PendingUpdate),
 }
 
 pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSender<()> {
+    if !updater::can_self_update() {
+        // Never download a replacement this installation may not apply.
+        let (request, receive) = mpsc::sync_channel(1);
+        let _ = events.try_send(TrayEvent::Update(Notice::NotInstallable));
+        std::thread::spawn(move || {
+            while receive.recv().is_ok() {
+                if stop.load(Ordering::Relaxed)
+                    || events
+                        .send_blocking(TrayEvent::Update(Notice::NotInstallable))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        return request;
+    }
     start_worker(events, stop, Duration::from_secs(10), |progress| {
         updater::check_with_progress(progress)
     })
