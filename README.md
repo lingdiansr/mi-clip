@@ -90,9 +90,9 @@ X11、其他 X11 会话和 GNOME 不在支持范围，程序不会回退到 X11 
 
 ### Linux 验证范围
 
-仓库内的 `tests/linux_smoke.py` 在私有 `dbus-daemon`、headless Sway 与临时 0700 XDG 目录中运行真实二进制：状态窗口、Rhai 刷新、Esc、`--show` 重开、Ctrl-Q、第二实例互斥、无登录时的分享错误、取消后重开与并发 Busy，并可截图留证。CI 在 Ubuntu 24.04 的 x86_64 与 aarch64 runner 上执行该冒烟测试。
-剪贴板的真实多 MIME 选择由 ignored 集成测试 `clipboard::wayland::tests::native_selection_round_trip` 在私有合成器中验证。
-本机开发环境缺少合成器与 Vulkan 运行时，GUI 冒烟未在开发机执行；KDE/wlroots 真机托盘、Dolphin 入口和手机互操作仍需要人工验收。
+`tests/linux_smoke.py` 在私有 `dbus-daemon` 与临时 0700 XDG 目录中运行真实二进制。CI 使用 headless Sway；没有 Sway 时，它会以外层 Wayland 会话里的嵌套 niri 作为私有合成器（外层只负责显示传输，剪贴板、D-Bus、配置和 socket 都是私有的）。覆盖：真实 Wayland 前置检查、状态窗口、Rhai 刷新、Esc、`--show` 重开、Ctrl-Q、第二实例互斥、无登录时的分享错误、取消后重开、选中手机后的配置错误终态与并发 Busy，并在检查点用 grim 截图。
+ignored 集成测试 `clipboard::wayland::tests::native_selection_round_trip` 在同一类私有合成器中验证外部 `wl-copy` 文本、URI/图片优先级、不支持图片不降级为文本、自身 selection 不回传；`updater::tests::real_gui_restart_reports_ready` 验证升级重启与 health 回执。
+开发机上已用嵌套 niri 跑通上述 GUI 冒烟、剪贴板与升级重启测试；KDE/wlroots 真机托盘、Dolphin 入口、设备列表滚动与手机互操作仍需要人工验收。
 
 ## 构建
 
