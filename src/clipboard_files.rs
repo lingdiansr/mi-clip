@@ -341,4 +341,28 @@ mod tests {
         assert!(Offer::open(vec![root.clone()], 1).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn symlinks_fifos_and_directories_are_rejected_without_blocking() {
+        let root = std::env::temp_dir().join(format!(
+            "clip-offer-kinds-{:016x}",
+            u64::from_ne_bytes(crate::private::random().unwrap())
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("target.bin");
+        std::fs::write(&target, b"payload").unwrap();
+        let link = root.join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // O_NOFOLLOW: the link itself is never opened.
+        assert!(Offer::open(vec![link], 1).is_err(), "symlink was followed");
+        // O_NONBLOCK plus the regular-file check: opening a FIFO cannot hang.
+        let fifo = root.join("pipe.bin");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(Offer::open(vec![fifo], 1).is_err(), "FIFO was accepted");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(Offer::open(vec![root.clone()], 1).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

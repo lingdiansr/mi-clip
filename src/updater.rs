@@ -530,6 +530,11 @@ pub fn install(pending: PendingUpdate, arguments: &[std::ffi::OsString]) -> anyh
         "更新类型与当前平台不符"
     );
     #[cfg(target_os = "macos")]
+    anyhow::ensure!(
+        pending.release.kind != Artifact::LinuxBinary,
+        "更新类型与当前平台不符"
+    );
+    #[cfg(target_os = "macos")]
     if pending.release.kind == Artifact::AppZip {
         return bundle::install(&pending, arguments);
     }

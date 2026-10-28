@@ -5,6 +5,10 @@
 //! socket protocol, no X11 property, no PID file.
 use std::{
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use zbus::blocking::Connection;
@@ -23,6 +27,8 @@ pub enum Request {
 
 struct ControlInterface {
     events: async_channel::Sender<Request>,
+    /// True while a picker or transfer owns the single share slot.
+    reservation: Arc<AtomicBool>,
 }
 
 #[zbus::interface(name = "com.cyeam.miclip.Control")]
@@ -36,7 +42,20 @@ impl ControlInterface {
     fn share(&self, uris: Vec<String>) -> zbus::fdo::Result<()> {
         let paths = validate_uris(&uris)
             .map_err(|error| zbus::fdo::Error::InvalidArgs(format!("{error:#}")))?;
-        self.events.try_send(Request::Share(paths)).map_err(busy)
+        // Reserve the single share slot before the request is queued, so two
+        // concurrent calls cannot both report success and replace a picker.
+        if self
+            .reservation
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed("Busy".into()));
+        }
+        if let Err(error) = self.events.try_send(Request::Share(paths)) {
+            self.reservation.store(false, Ordering::SeqCst);
+            return Err(busy(error));
+        }
+        Ok(())
     }
 }
 
@@ -79,6 +98,7 @@ pub fn session(
     show: bool,
     share: &[PathBuf],
     explicit_config: bool,
+    reservation: Arc<AtomicBool>,
 ) -> anyhow::Result<Option<Control>> {
     let uris = encode_paths(share)?;
     let (sender, receiver) = async_channel::bounded(32);
@@ -96,6 +116,7 @@ pub fn session(
                     OBJECT_PATH,
                     ControlInterface {
                         events: sender.clone(),
+                        reservation: Arc::clone(&reservation),
                     },
                 )
                 .map_err(|error| anyhow::anyhow!("无法注册控制接口：{error}"))?;
@@ -236,6 +257,15 @@ mod tests {
         assert!(validate_uris(&too_many).is_err());
         let oversized = format!("file:///tmp/{}", "x".repeat(MAX_SHARE_BYTES));
         assert!(validate_uris(&[oversized]).is_err());
+    }
+
+    #[test]
+    fn non_utf8_paths_round_trip_without_loss() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_vec(b"photo-\xff.bin".to_vec());
+        let path = PathBuf::from("/tmp").join(name);
+        let uris = encode_paths(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(validate_uris(&uris).unwrap(), vec![path]);
     }
 
     #[test]

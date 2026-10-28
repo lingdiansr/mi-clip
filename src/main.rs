@@ -194,7 +194,12 @@ fn main() -> anyhow::Result<()> {
     {
         let show_request = options.show || (!options.background && options.share.is_empty());
         if !smoke {
-            match linux_control::session(show_request, &options.share, options.config.is_some())? {
+            match linux_control::session(
+                show_request,
+                &options.share,
+                options.config.is_some(),
+                runtime.share.clone(),
+            )? {
                 Some(control) => *runtime.control.lock().unwrap() = Some(control),
                 None => return Ok(()),
             }
