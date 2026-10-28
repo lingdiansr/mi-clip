@@ -612,14 +612,8 @@ fn exchange(
         config.clipboard_sync = true;
         #[cfg(feature = "file-sharing")]
         if config.receive_directory.is_none() {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| anyhow::anyhow!("Home directory unavailable"))?;
-            config.receive_directory = Some(
-                std::path::PathBuf::from(home)
-                    .join("Downloads")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            config.receive_directory =
+                Some(crate::paths::receive_dir()?.to_string_lossy().into_owned());
         }
     }
     config
@@ -634,16 +628,14 @@ fn exchange(
     #[cfg(not(feature = "file-sharing"))]
     let selected_target: Option<SocketAddr> = None;
     if stop.is_some() && selected_target.is_none() {
-        use std::net::ToSocketAddrs;
         if let Ok(endpoints) = crate::discovery::discover(Duration::from_secs(3)) {
             if let Some(address) = endpoints
                 .iter()
-                .filter(|e| e.device_type == 1)
-                .filter_map(|e| (e.host.as_str(), e.kcp_port).to_socket_addrs().ok())
-                .flatten()
-                .find(|a| a.is_ipv4())
+                .filter(|endpoint| endpoint.device_type == 1)
+                .flat_map(|endpoint| endpoint.socket_addresses())
+                .find(|address| address.is_ipv4())
             {
-                config.endpoint = address;
+                config.endpoint = *address;
             }
         }
     }
@@ -738,26 +730,23 @@ fn exchange(
         "Clipboard feature required"
     );
     #[cfg(feature = "clipboard")]
-    let mut clipboard_count = if config.clipboard_sync {
-        crate::clipboard::change_count()
+    let mut clipboard_reader = if config.clipboard_sync {
+        // A manual interoperability run may start after the user copied its
+        // test payload, so it inspects the current snapshot once. A resident
+        // session establishes its baseline before authentication and therefore
+        // never replays old text or files.
+        Some(crate::clipboard::Reader::open(
+            cfg!(feature = "research") && directory.is_some(),
+        )?)
     } else {
-        0
+        None
     };
-    // A manual interoperability run may start after the user copied its test
-    // file. Inspect that current snapshot once; resident startup reoffers only
-    // the current image via read_update and does not replay old text or files.
-    #[cfg(all(feature = "research", feature = "clipboard"))]
-    if directory.is_some() && config.clipboard_sync {
-        clipboard_count = clipboard_count.wrapping_sub(1);
-    }
     #[cfg(feature = "clipboard")]
     let mut last_text: Option<String> = None;
     #[cfg(feature = "clipboard")]
     let mut sequence = private::random::<1>()?[0];
     #[cfg(feature = "clipboard")]
     let mut network_ready = false;
-    #[cfg(feature = "clipboard")]
-    let mut initial_clipboard = true;
     while Instant::now() < deadline {
         #[cfg(feature = "file-sharing")]
         {
@@ -879,10 +868,11 @@ fn exchange(
         );
         #[cfg(feature = "clipboard")]
         if config.clipboard_sync && network_ready && active_key.is_some() {
-            let snapshot = crate::clipboard::read_update(clipboard_count, initial_clipboard);
-            initial_clipboard = false;
-            if let Some((count, content)) = snapshot {
-                clipboard_count = count;
+            let snapshot = match clipboard_reader.as_mut() {
+                Some(reader) => reader.poll()?,
+                None => None,
+            };
+            if let Some(content) = snapshot {
                 #[cfg(feature = "file-sharing")]
                 {
                     clipboard_offer = None;
@@ -942,7 +932,7 @@ fn exchange(
                             .send(&encrypted_payload(active_key.as_ref().unwrap(), &payload)?)?;
                         on_event(SyncEvent::Sent(text.len()));
                         diagnostic!(
-                            "Mac → phone: encrypted text sent, {} bytes; delivery needs phone verification.",
+                            "Computer → phone: encrypted text sent, {} bytes; delivery needs phone verification.",
                             text.len()
                         );
                     } else {
@@ -1424,11 +1414,14 @@ fn exchange(
                                         file_service = None;
                                     }
                                 }
-                                clipboard_count = crate::clipboard::write(text)?;
+                                match clipboard_reader.as_mut() {
+                                    Some(reader) => reader.write_text(text)?,
+                                    None => anyhow::bail!("Clipboard reader unavailable"),
+                                }
                                 last_text = Some(text.to_owned());
                                 on_event(SyncEvent::Received(text.len()));
                                 diagnostic!(
-                                    "Phone → Mac: text written to native clipboard, {} bytes.",
+                                    "Phone → computer: text written to the native clipboard, {} bytes.",
                                     text.len()
                                 );
                             }

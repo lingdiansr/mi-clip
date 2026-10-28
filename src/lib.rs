@@ -25,6 +25,7 @@ pub mod message_center;
 pub mod networking;
 #[cfg(feature = "research")]
 mod notifications;
+pub mod paths;
 mod private;
 #[cfg(feature = "file-sharing")]
 pub mod share_queue;

@@ -147,13 +147,13 @@ pub fn run(a: &[String]) -> anyhow::Result<()> {
         let text = crate::message_center::payload_text(&bytes).ok_or_else(|| {
             anyhow::anyhow!("Payload is not a supported inline text clipboard event")
         })?;
-        crate::clipboard::write(text)?;
+        crate::clipboard::write_text(text)?;
         anyhow::ensure!(
-            crate::clipboard::read().1.as_deref() == Some(text),
+            crate::clipboard::read_text()?.as_deref() == Some(text),
             "Clipboard readback mismatch"
         );
         println!(
-            "Phone text written to macOS clipboard and read back exactly: {} bytes. No content printed.",
+            "Phone text written to the system clipboard and read back exactly: {} bytes. This is a one-shot diagnostic: the text is not retained after this process exits. No content printed.",
             text.len()
         );
         return Ok(());

@@ -77,7 +77,7 @@ fn outcome(value: Outcome) -> &'static str {
 }
 fn sdk_event(id: &str, event: &Event) -> posthog_rs::Event {
     let mut props = json!({
-        "app": "mi-clip", "platform": "macos", "app_version": env!("CARGO_PKG_VERSION"),
+        "app": "mi-clip", "platform": std::env::consts::OS, "app_version": env!("CARGO_PKG_VERSION"),
         "os": std::env::consts::OS, "architecture": std::env::consts::ARCH,
         "$process_person_profile": false
     });

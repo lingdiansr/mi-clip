@@ -12,6 +12,14 @@
 !/src/*.rs
 !/src/bin/
 !/src/bin/*.rs
+!/src/clipboard/
+!/src/clipboard/*.rs
+!/src/discovery/
+!/src/discovery/*.rs
+!/src/tray/
+!/src/tray/*.rs
+!/src/share_queue/
+!/src/share_queue/*.rs
 !/ui/
 !/ui/*.rhai
 !/assets/
@@ -25,10 +33,14 @@
 !/tools/prepare-release.py
 !/tests/
 !/tests/*.py
+!/linux/
+!/linux/*.desktop
 
 !/macos/
 !/macos/*.swift
 !/macos/*.entitlements
 !/tools/build-app.sh
+!/tools/build-linux.sh
+!/tools/install-linux.py
 
 !/tools/build-icon.swift

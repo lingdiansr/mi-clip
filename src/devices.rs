@@ -2,7 +2,7 @@
 use crate::tray::TrayEvent;
 use async_channel::Sender;
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -106,10 +106,9 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
                         }) {
                             continue;
                         }
-                        let addresses = (endpoint.host.as_str(), endpoint.kcp_port)
-                            .to_socket_addrs()
-                            .map(|a| a.collect())
-                            .unwrap_or_default();
+                        // The endpoint caches the addresses discovery already
+                        // resolved; the catalogue keeps them for later use.
+                        let addresses = endpoint.socket_addresses().to_vec();
                         let name = endpoint.model.filter(|s| !s.is_empty()).unwrap_or_else(|| {
                             endpoint.host.trim_end_matches(".local.").to_owned()
                         });

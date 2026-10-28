@@ -116,11 +116,12 @@ impl Offer {
                 crate::file_store::valid_name(name),
                 "Unsupported clipboard filename"
             );
-            // macOS O_NOFOLLOW. Pin the selected inode so a later path swap
-            // cannot expose a different file through an old clipboard offer.
+            // Never follow a symlink and never block on a FIFO: the pinned
+            // inode must already be the regular file the user selected.
+            // std adds O_CLOEXEC itself.
             let file = OpenOptions::new()
                 .read(true)
-                .custom_flags(0x104)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&path)?;
             let stamp = fingerprint(&file)?;
             let size = stamp.2;

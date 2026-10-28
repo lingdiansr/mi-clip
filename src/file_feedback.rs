@@ -1,4 +1,4 @@
-//! File-only menu-bar feedback. Contains no filenames, paths or file contents.
+//! File-only status feedback. Contains no filenames, paths or file contents.
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

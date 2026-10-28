@@ -339,7 +339,9 @@ fn replace_and_launch(
     Ok(())
 }
 
-#[cfg(test)]
+// The archive fixtures are macOS application bundles and the exchange step is
+// a macOS-only operation, so these tests only run on macOS.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};

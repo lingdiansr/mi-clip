@@ -16,7 +16,7 @@ pub fn deliver(saved: bool) {
         if !result.is_ok_and(|status| status.success())
             && std::env::var_os("MICLIP_DIAGNOSTICS").is_some()
         {
-            eprintln!("System notification unavailable; menu-bar feedback remains active.");
+            eprintln!("System notification unavailable; status feedback remains active.");
         }
     });
 }
