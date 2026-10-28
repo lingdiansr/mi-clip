@@ -621,6 +621,20 @@ mod tests {
             mime_type: MimeType::Text,
         };
 
+        // An independent owner (wl-copy) is read like any foreign selection.
+        if std::process::Command::new("wl-copy")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            let status = std::process::Command::new("wl-copy")
+                .arg("外部文本")
+                .status()
+                .unwrap();
+            assert!(status.success(), "wl-copy failed");
+            let mut reader = Reader::open(true).unwrap();
+            assert!(matches!(wait(&mut reader), Some(Content::Text(text)) if text == "外部文本"));
+        }
         // Independent text round trip and selection replacement.
         copy_text("first 文本").unwrap();
         assert_eq!(read_text().unwrap().as_deref(), Some("first 文本"));
