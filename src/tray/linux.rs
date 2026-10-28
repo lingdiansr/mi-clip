@@ -472,8 +472,13 @@ fn smoke_test(
                 })??;
                 Ok(())
             })?;
+            // Give the harness a painted frame to capture before closing.
             cx.background_executor()
-                .timer(Duration::from_millis(400))
+                .timer(Duration::from_millis(600))
+                .await;
+            println!("SMOKE CHECKPOINT: status window ready");
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
                 .await;
             cx.update(|cx| -> anyhow::Result<()> {
                 let handle = cx.windows()[0]
@@ -493,7 +498,6 @@ fn smoke_test(
                 anyhow::ensure!(cx.windows().is_empty(), "Escape did not close the window");
                 Ok(())
             })?;
-            println!("SMOKE CHECKPOINT: status window reopens");
             test_events.try_send(TrayEvent::Show)?;
             cx.background_executor()
                 .timer(Duration::from_millis(900))

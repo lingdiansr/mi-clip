@@ -100,7 +100,12 @@ pub fn session(
     explicit_config: bool,
     reservation: Arc<AtomicBool>,
 ) -> anyhow::Result<Option<Control>> {
-    let uris = encode_paths(share)?;
+    // Background or plain launches carry no files at all.
+    let uris = if share.is_empty() {
+        Vec::new()
+    } else {
+        encode_paths(share)?
+    };
     let (sender, receiver) = async_channel::bounded(32);
     let connection =
         Connection::session().map_err(|error| anyhow::anyhow!("无法连接会话 D-Bus：{error}"))?;

@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import sys
 import tempfile
 import time
@@ -30,7 +31,13 @@ def need(tool):
 
 
 class Session:
-    """Private bus, compositor and XDG directories for one test run."""
+    """Private bus, compositor and XDG directories for one test run.
+
+    Prefers a headless Sway, which is what CI installs. Where Sway is absent but
+    an outer Wayland session with niri exists, niri runs nested with a private
+    runtime directory; the outer compositor is only used as a display transport,
+    and no outer clipboard, bus or configuration is touched.
+    """
 
     def __init__(self):
         self.root = Path(tempfile.mkdtemp(prefix="miclip-smoke-"))
@@ -61,14 +68,38 @@ class Session:
         address, pid = bus.stdout.split()
         self.bus_pid = int(pid)
         self.env["DBUS_SESSION_BUS_ADDRESS"] = address
-        config = self.root / "sway.conf"
-        config.write_text("output HEADLESS-1 mode 1280x800\n", encoding="utf-8")
-        self.sway = subprocess.Popen(
-            ["sway", "-c", str(config), "-d"],
-            env=self.env,
-            stdout=self.log,
-            stderr=self.log,
-        )
+        self.outer = set()
+        if shutil.which("sway"):
+            config = self.root / "sway.conf"
+            config.write_text("output HEADLESS-1 mode 1280x800\n", encoding="utf-8")
+            self.compositor = subprocess.Popen(
+                ["sway", "-c", str(config), "-d"],
+                env=self.env,
+                stdout=self.log,
+                stderr=self.log,
+            )
+        elif shutil.which("niri") and os.environ.get("WAYLAND_DISPLAY"):
+            # Silence niri's first-run hotkey overlay so screenshots show the app.
+            niri_config = self.root / "config" / "niri"
+            niri_config.mkdir(mode=0o700, parents=True)
+            (niri_config / "config.kdl").write_text(
+                "hotkey-overlay {\n    skip-at-startup\n}\n", encoding="utf-8"
+            )
+            outer_runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+            outer_display = os.environ["WAYLAND_DISPLAY"]
+            for entry in outer_runtime.glob(f"{outer_display}*"):
+                (self.root / "runtime" / entry.name).symlink_to(entry)
+                self.outer.add(entry.name)
+            self.compositor = subprocess.Popen(
+                ["niri"],
+                env={**self.env, "WAYLAND_DISPLAY": outer_display},
+                stdout=self.log,
+                stderr=self.log,
+            )
+        else:
+            raise SystemExit(
+                "FAIL: install sway, or run inside a Wayland session with niri"
+            )
         self.display = self._wait_wayland()
         self.env["WAYLAND_DISPLAY"] = self.display
         self.apps = []
@@ -76,15 +107,15 @@ class Session:
     def _wait_wayland(self):
         deadline = time.time() + 30
         while time.time() < deadline:
-            if self.sway.poll() is not None:
+            if self.compositor.poll() is not None:
                 self.log.flush()
                 tail = (self.root / "session.log").read_text(errors="replace")[-4000:]
-                raise SystemExit(f"FAIL: sway exited early\n{tail}")
-            sockets = sorted((self.root / "runtime").glob("wayland-*"))
-            if sockets:
-                return sockets[0].name
+                raise SystemExit(f"FAIL: compositor exited early\n{tail}")
+            for socket in sorted((self.root / "runtime").glob("wayland-*")):
+                if socket.name not in self.outer and not socket.name.endswith(".lock"):
+                    return socket.name
             time.sleep(0.1)
-        raise SystemExit("FAIL: headless sway did not publish a Wayland socket")
+        raise SystemExit("FAIL: the compositor did not publish a Wayland socket")
 
     def run(self, arguments, env=None, timeout=TIMEOUT):
         return subprocess.run(
@@ -125,12 +156,12 @@ class Session:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill()
-        if self.sway.poll() is None:
-            self.sway.terminate()
+        if self.compositor.poll() is None:
+            self.compositor.terminate()
             try:
-                self.sway.wait(timeout=10)
+                self.compositor.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                self.sway.kill()
+                self.compositor.kill()
         subprocess.run(["kill", str(self.bus_pid)], check=False)
         self.log.close()
         shutil.rmtree(self.root, ignore_errors=True)
@@ -215,20 +246,41 @@ def share_requires_login(session):
     print("PASS: --share without login reports a visible error and keeps no slot")
 
 
-def share_picker(session):
-    """Selecting a fixture phone fails visibly when the configuration is bad."""
-    config = session.root / "config.json"
+def default_config(session):
+    """Writes the private default configuration path used by every launch."""
+    directory = session.root / "config" / "mi-clip"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config = directory / "config.json"
     config.write_text("{}", encoding="utf-8")
     os.chmod(config, 0o600)
+    return config
+
+
+def share_picker(session):
+    """Selecting a fixture phone fails visibly when the configuration is bad."""
+    default_config(session)
     sample = session.root / "photo.png"
     sample.write_bytes(b"synthetic")
     env = {
         "MICLIP_DEVICE_FIXTURE": "192.0.2.1:1234",
         "MICLIP_SHARE_FIXTURE": "select",
     }
-    app = session.spawn(
-        ["--share", str(sample), "--background", "--config", str(config)], env=env
-    )
+    # Flags must precede --share: everything after it is a file name.
+    app = session.spawn(["--background", "--share", str(sample)], env=env)
+    stderr_lines = []
+    threading.Thread(
+        target=lambda: stderr_lines.extend(app.stderr), daemon=True
+    ).start()
+    # The fixture selects the only phone; the malformed configuration must then
+    # settle the task as a visible failure instead of a silent success.
+    failure_deadline = time.time() + 30
+    while time.time() < failure_deadline and not any(
+        "失败" in line for line in stderr_lines
+    ):
+        time.sleep(0.3)
+    if not any("失败" in line for line in stderr_lines):
+        fail("selecting a phone did not surface the configuration failure")
+    print("PASS: selecting a phone surfaces the configuration failure")
     deadline = time.time() + 30
     stderr = ""
     while time.time() < deadline:
@@ -254,18 +306,15 @@ def share_picker(session):
 
 def share_cancel_reopen(session):
     """Cancelling the picker releases the slot for the next request."""
-    config = session.root / "config.json"
-    config.write_text("{}", encoding="utf-8")
-    os.chmod(config, 0o600)
+    default_config(session)
     sample = session.root / "note.txt"
     sample.write_text("fixture", encoding="utf-8")
     env = {
         "MICLIP_DEVICE_FIXTURE": "192.0.2.1:1234",
         "MICLIP_SHARE_FIXTURE": "cancel",
     }
-    app = session.spawn(
-        ["--share", str(sample), "--background", "--config", str(config)], env=env
-    )
+    # Flags must precede --share: everything after it is a file name.
+    app = session.spawn(["--background", "--share", str(sample)], env=env)
     deadline = time.time() + 30
     while time.time() < deadline and app.poll() is None:
         time.sleep(0.5)
@@ -281,7 +330,7 @@ def share_cancel_reopen(session):
 def main():
     if not BINARY.is_file():
         fail(f"binary not found: {BINARY}")
-    for tool in ("dbus-daemon", "sway"):
+    for tool in ("dbus-daemon",):
         need(tool)
     guard_without_wayland()
     session = Session()
