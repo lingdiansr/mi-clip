@@ -353,6 +353,7 @@ fn parse_selection(
             .and_then(|bytes| parse_uri_list(&bytes))
         {
             Ok(paths) => Content::Files(paths),
+            // A failed or oversized file representation never falls back to text.
             Err(_) => Content::Unsupported,
         };
     }
@@ -598,11 +599,16 @@ mod tests {
     #[test]
     #[ignore]
     fn native_selection_round_trip() {
+        /// First non-revocation content; `Unsupported` alone means no business
+        /// content arrived (the reader revokes an older offer before parsing).
         fn wait(reader: &mut Reader) -> Option<Content> {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                if let Ok(Some(content)) = reader.poll() {
-                    return Some(content);
+                match reader.poll() {
+                    Ok(Some(Content::Unsupported)) => (),
+                    Ok(Some(content)) => return Some(content),
+                    Ok(None) => (),
+                    Err(error) => panic!("clipboard reader failed: {error:#}"),
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -612,6 +618,9 @@ mod tests {
             let mut options = Options::new();
             options.seat(copy::Seat::Specific(seat_name().unwrap()));
             options.copy_multi(sources).unwrap();
+            // Let the compositor publish the new selection before the watcher
+            // establishes its baseline, so the first content is the new one.
+            std::thread::sleep(Duration::from_millis(300));
             let mut reader = Reader::open(true).unwrap();
             wait(&mut reader)
         }
@@ -632,21 +641,33 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(status.success(), "wl-copy failed");
-            let mut reader = Reader::open(true).unwrap();
-            assert!(matches!(wait(&mut reader), Some(Content::Text(text)) if text == "外部文本"));
+            // The forked owner may publish a moment after wl-copy exits.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut observed = None;
+            while Instant::now() < deadline {
+                if let Some(text) = read_text().unwrap()
+                    && text == "外部文本"
+                {
+                    observed = Some(text);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(
+                observed.as_deref(),
+                Some("外部文本"),
+                "foreign wl-copy selection was not readable"
+            );
         }
         // Independent text round trip and selection replacement.
         copy_text("first 文本").unwrap();
         assert_eq!(read_text().unwrap().as_deref(), Some("first 文本"));
         copy_text("second").unwrap();
         assert_eq!(read_text().unwrap().as_deref(), Some("second"));
-        // Our own selection never becomes outgoing text.
+        // Our own selection only ever produces a revocation, never text.
         {
             let mut reader = Reader::open(true).unwrap();
-            assert!(matches!(
-                wait(&mut reader),
-                Some(Content::Unsupported) | None
-            ));
+            assert!(wait(&mut reader).is_none());
         }
         // The copy owner still serves text after the reader is gone.
         assert_eq!(read_text().unwrap().as_deref(), Some("second"));
@@ -655,22 +676,27 @@ mod tests {
         let first = temp_path("selection.bin");
         let second = temp_path("second selection.txt");
         std::fs::write(&first, b"synthetic").unwrap();
+        std::fs::write(&second, b"").unwrap();
         let body = format!(
             "file://{}\r\nfile://{}\r\n",
             first.display(),
             second.display()
         )
         .replace(' ', "%20");
-        assert!(matches!(
-            selection(vec![
-                MimeSource {
-                    source: bytes(&body),
-                    mime_type: MimeType::Specific(URI_MIME.into()),
-                },
-                text(),
-            ]),
-            Some(Content::Files(paths)) if paths == vec![first.clone(), second.clone()]
-        ));
+        let observed = selection(vec![
+            MimeSource {
+                source: bytes(&body),
+                mime_type: MimeType::Specific(URI_MIME.into()),
+            },
+            text(),
+        ]);
+        assert!(
+            matches!(
+                &observed,
+                Some(Content::Files(paths)) if *paths == vec![first.clone(), second.clone()]
+            ),
+            "URI selection did not win over text"
+        );
 
         // An image wins over accompanying text, byte for byte.
         let mut png = Vec::new();
@@ -696,16 +722,17 @@ mod tests {
         ));
 
         // An unsupported image representation never degrades to accompanying text.
-        assert!(matches!(
+        assert!(
             selection(vec![
                 MimeSource {
                     source: bytes("not an image"),
                     mime_type: MimeType::Specific("image/webp".into()),
                 },
                 text(),
-            ]),
-            Some(Content::Unsupported) | None
-        ));
+            ])
+            .is_none(),
+            "unsupported image fell back to text"
+        );
         std::fs::remove_file(&first).unwrap();
         std::fs::remove_file(&second).unwrap();
     }
