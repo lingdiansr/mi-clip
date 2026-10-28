@@ -55,3 +55,65 @@ jobs:
         run: python3 tests/share_registration_test.py target/app/Clip.app
       - name: Verify native share picker and transfer progress
         run: python3 tests/share_ui_test.py target/app/Clip.app
+
+  linux:
+    # Every push and manual run checks both supported Linux architectures.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      MI_CLIP_UPDATE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate keys per platform so the macOS caches are never reused.
+          shared-key: linux-${{ matrix.arch }}
+      - name: Install Linux build and smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libvulkan-dev \
+            libfontconfig1-dev libfreetype6-dev libcurl4-openssl-dev \
+            ca-certificates mesa-vulkan-drivers fonts-noto-cjk \
+            dbus-daemon sway wl-clipboard grim
+      - name: Protocol, analytics and updater tests
+        run: |
+          cargo test --locked --no-default-features --lib
+          cargo test --locked --no-default-features --features research,analytics --lib
+      - name: Status window tests
+        run: cargo test --locked --bin mi-clip
+      - name: Build optimized binary
+        run: sh tools/build-release.sh --bin mi-clip
+      - name: Validate UI scripts and device negotiation
+        run: |
+          target/release/mi-clip --check-ui
+          python3 tests/probe_test.py target/release/mi-clip
+      - name: Native Wayland clipboard selection test
+        run: sh tools/linux-clipboard-test.sh
+      - name: Isolated Wayland smoke test
+        run: python3 tests/linux_smoke.py target/release/mi-clip
+      - name: Package the Linux desktop build
+        run: |
+          MI_CLIP_SKIP_BUILD=1 sh tools/build-linux.sh
+          tar -tzf "target/linux/Clip-linux-${{ matrix.arch }}.tar.gz" >/dev/null

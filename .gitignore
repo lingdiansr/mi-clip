@@ -35,6 +35,7 @@
 !/tests/*.py
 !/linux/
 !/linux/*.desktop
+!/linux/*.svg
 
 !/macos/
 !/macos/*.swift
@@ -42,5 +43,6 @@
 !/tools/build-app.sh
 !/tools/build-linux.sh
 !/tools/install-linux.py
+!/tools/linux-clipboard-test.sh
 
 !/tools/build-icon.swift

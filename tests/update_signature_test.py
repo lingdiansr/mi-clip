@@ -19,10 +19,27 @@ envelope = json.loads(args.manifest.read_bytes())
 payload = base64.b64decode(envelope["payload"], validate=True)
 signature = base64.b64decode(envelope["signature"], validate=True)
 release = json.loads(payload)
-assert release.get("kind", "binary") == ("app_zip" if args.binary.suffix == ".zip" else "binary")
+kind = release.get("kind", "binary")
+name = args.binary.name
+# The asset name must belong to the platform its kind describes.
+if kind == "binary":
+    assert name.startswith("mi-clip-macos-"), name
+elif kind == "app_zip":
+    assert name == f"Clip-macos-{release['arch']}.zip", name
+elif kind == "linux_binary":
+    assert name == f"mi-clip-linux-{release['arch']}", name
+else:
+    raise SystemExit(f"unknown artifact kind: {kind}")
 binary = args.binary.read_bytes()
 assert len(binary) == release["size"]
 assert hashlib.sha256(binary).hexdigest() == release["sha256"]
+# The payload format must match the kind too.
+if kind == "linux_binary":
+    assert binary[:4] == b"\x7fELF" and binary[4] == 2 and binary[5] == 1, "not an ELF64 executable"
+elif kind == "binary":
+    assert binary[:4] == bytes.fromhex("cffaedfe"), "not a Mach-O executable"
+else:
+    assert binary[:2] == b"PK", "not a zip archive"
 with tempfile.TemporaryDirectory(prefix="miclip-signature-") as directory:
     root = Path(directory)
     # Standard SubjectPublicKeyInfo for an uncompressed P-256 public point.

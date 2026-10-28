@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mi Clip
+Comment=与小米手机同步剪贴板并接收文件
+Exec=mi-clip --show
+Icon=mi-clip
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;share;xiaomi;

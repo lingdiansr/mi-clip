@@ -162,8 +162,119 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-linux:
+    needs: [validate, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_ARCH: ${{ matrix.arch }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      MI_CLIP_UPDATE_REPOSITORY: ${{ github.repository }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set Cargo version for this release
+        run: python3 tools/prepare-release.py "$RELEASE_VERSION"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-${{ matrix.arch }}
+          save-if: 'false'
+      - name: Install Linux build and smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-randr0-dev libvulkan-dev \
+            libfontconfig1-dev libfreetype6-dev libcurl4-openssl-dev \
+            ca-certificates mesa-vulkan-drivers fonts-noto-cjk \
+            dbus-daemon sway wl-clipboard grim
+      - name: Test protocol, analytics and updater
+        run: |
+          cargo test --locked --no-default-features --lib
+          cargo test --locked --no-default-features --features research,analytics --lib
+          cargo test --locked --bin mi-clip
+      - name: Build optimized binary
+        run: sh tools/build-release.sh --bin mi-clip
+      - name: Validate UI scripts and device negotiation
+        run: |
+          target/release/mi-clip --check-ui
+          python3 tests/probe_test.py target/release/mi-clip
+      - name: Native Wayland clipboard selection test
+        run: sh tools/linux-clipboard-test.sh
+      - name: Isolated Wayland smoke test
+        run: python3 tests/linux_smoke.py target/release/mi-clip
+      - name: Sign and independently verify the Linux asset
+        env:
+          MI_CLIP_SIGNING_KEY: ${{ secrets.MI_CLIP_SIGNING_KEY }}
+        run: |
+          umask 077
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/miclip-signing.XXXXXX")
+          export SIGNING_DIR="$signing_dir"
+          trap 'rm -rf "$signing_dir"' EXIT
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['SIGNING_DIR'])
+          try:
+              key = base64.b64decode(os.environ['MI_CLIP_SIGNING_KEY'], validate=True)
+          except (ValueError, KeyError):
+              raise SystemExit('Configure MI_CLIP_SIGNING_KEY as a Base64-encoded 32-byte P-256 release key.') from None
+          if len(key) != 32:
+              raise SystemExit('MI_CLIP_SIGNING_KEY must contain exactly 32 decoded bytes.')
+          (root / 'signing.key').write_bytes(key)
+          config = {
+              'version': os.environ['RELEASE_VERSION'],
+              'arch': os.environ['RELEASE_ARCH'],
+              'repository': os.environ['MI_CLIP_UPDATE_REPOSITORY'],
+              'binary': str(Path('target/release/mi-clip').resolve()),
+              'private_key': str(root / 'signing.key'),
+          }
+          (root / 'release.json').write_text(json.dumps(config))
+          PY
+          mkdir -p release-assets
+          target/release/mi-clip --auth sign-update "$signing_dir/release.json" release-assets
+          python3 tests/update_signature_test.py \
+            "release-assets/manifest-linux-${RELEASE_ARCH}.json" \
+            "release-assets/mi-clip-linux-${RELEASE_ARCH}"
+          (cd release-assets && sha256sum "mi-clip-linux-${RELEASE_ARCH}" > "mi-clip-linux-${RELEASE_ARCH}.sha256")
+      - name: Repackage with the signed manifest
+        run: |
+          MI_CLIP_SKIP_BUILD=1 sh tools/build-linux.sh \
+            --manifest "release-assets/manifest-linux-${RELEASE_ARCH}.json"
+          (cd target/linux && sha256sum -c "Clip-linux-${RELEASE_ARCH}.tar.gz.sha256")
+          cp "target/linux/Clip-linux-${RELEASE_ARCH}.tar.gz" release-assets/
+          (cd release-assets && sha256sum "Clip-linux-${RELEASE_ARCH}.tar.gz" > "Clip-linux-${RELEASE_ARCH}.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: build
+    # Both platforms and all four build jobs must succeed before publishing.
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -174,7 +285,7 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
-      - name: Publish both architectures together
+      - name: Publish all architectures together
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -187,6 +298,11 @@ jobs:
             test -s "release-assets/manifest-app-macos-${arch}.json"
             test -s "release-assets/Clip-macos-${arch}.zip"
             (cd release-assets && sha256sum -c "Clip-macos-${arch}.zip.sha256")
+            test -s "release-assets/mi-clip-linux-${arch}"
+            test -s "release-assets/manifest-linux-${arch}.json"
+            (cd release-assets && sha256sum -c "mi-clip-linux-${arch}.sha256")
+            test -s "release-assets/Clip-linux-${arch}.tar.gz"
+            (cd release-assets && sha256sum -c "Clip-linux-${arch}.tar.gz.sha256")
           done
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "Mi Clip $RELEASE_TAG" --draft
@@ -219,6 +335,7 @@ jobs:
                   'text': (
                       f'Mi Clip {tag} 已编译并发布成功\n'
                       '支持 macOS Apple Silicon 和 Intel\n'
+                      '支持 Linux x86_64 和 aarch64（KDE Plasma Wayland / wlroots）\n'
                       f'下载地址：{release_url}\n'
                       f'构建记录：{run_url}'
                   ),

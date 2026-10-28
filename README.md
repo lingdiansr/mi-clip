@@ -1,6 +1,6 @@
 # Mi Clip
 
-轻量的 macOS 小米共享剪贴板客户端，Rust 实现，状态栏 UI 使用 gpui-rhai。
+轻量的小米共享剪贴板客户端，支持 macOS 与 Linux（Wayland），Rust 实现，状态 UI 使用 gpui-rhai。
 手机使用系统内置互联功能，无需安装新软件。运行时不加载小米官方库。
 
 <p>
@@ -50,6 +50,49 @@ Mac Finder 复制的一个 HEIC 文件已通过独立客户端传至手机，在
 Mac 直接复制的 PNG 图片也已在手机微信确认出现预览并发送成功；传输完成由手机协议确认。
 其他文件格式、多文件和大文件的手机粘贴行为尚未验证；本地合成测试覆盖分片与完成确认。
 其他系统版本和设备组合尚未验证。这是早期协议互操作版本。
+
+## Linux 支持（KDE Plasma Wayland / wlroots）
+
+仅支持 Wayland 会话：KDE Plasma Wayland 与 wlroots 系合成器（sway、labwc、niri 等）。
+X11、其他 X11 会话和 GNOME 不在支持范围，程序不会回退到 X11 或 XWayland；缺少
+`WAYLAND_DISPLAY`、无法连接合成器或设置了 `ZED_HEADLESS` 时直接报错退出。
+
+- 剪贴板使用 ext-data-control（优先）或 wlr-data-control；两者都缺失时窗口与错误链会明确提示“Wayland 缺少 ext-data-control / wlr-data-control”。
+- 文本、图片与文件沿用 macOS 的同一协议边界：3072 字节文本、32 MiB 编码图片、128 个文件/8 GiB；图片和文件按需取用，内容不落盘。
+- 状态窗口是普通 Wayland 窗口（app_id `com.cyeam.miclip`），关闭后继续同步；Esc 关闭，Ctrl-Q 退出。托盘使用 StatusNotifierItem，没有托盘宿主时窗口路径仍然可用。
+- 单实例使用会话 D-Bus 名称 `com.cyeam.miclip`。重复启动会把“显示状态”或分享请求转交给已运行实例；带 `--config` 的第二次启动明确提示“已有实例运行，请先退出后切换配置”。
+- 主动分享：`mi-clip --share 文件…`（以减号开头的名字用 `--share -- 文件…`），Dolphin 的“发送到 Mi Clip”服务菜单也调用它。窗口里选择一个手机会对所选手机重新认证，手机确认接收后自动关闭；失败保留窗口。
+- 默认启动显示状态窗口；`--background` 适合开机自启；`--show` 只显示已有窗口。
+- 配置与状态目录遵循 XDG：`$XDG_CONFIG_HOME/mi-clip`、`$XDG_STATE_HOME/mi-clip`；接收目录仍是 `~/Downloads`，可被配置覆盖。
+- 通知使用桌面通知服务；横幅不可用只影响提示，不影响文件传输。
+- 自更新只替换用户目录内的独立可执行文件。位于 `/usr`、`/opt`、`/nix/store` 或其他只读、非当前用户拥有的位置时，界面提示“请通过安装来源更新”，不会下载待替换文件。
+
+### Linux 构建与安装
+
+需要 Linux、Rust 1.95+、Wayland/xkbcommon 开发库、系统 curl（≥7.85）与 CA 证书。
+发布使用 Ubuntu 24.04 的 gnu/glibc 动态链接构建，不是 musl 静态通用包，不承诺旧发行版的 ABI 兼容。
+
+    ./tools/build-linux.sh
+    ./target/linux/Clip-linux-x86_64.tar.gz
+
+包内是 `bin/mi-clip`、桌面入口、Dolphin 服务菜单、图标与 `install.py`：
+
+    tar -xzf Clip-linux-x86_64.tar.gz
+    ./Clip-linux-x86_64/install.py
+
+安装只写入当前用户的 `~/.local/bin` 与 `~/.local/share`，不使用 sudo、不设置开机自启、不修改 PATH；KDE 需要可执行位才会加载用户服务菜单，安装脚本会给服务菜单 0755。应用运行不依赖 Python，`install.py` 只用标准库。
+本地源码构建不伪造签名清单；Release 工作流用同一把 P-256 密钥签名 `mi-clip-linux-{arch}` 与 `manifest-linux-{arch}.json`，独立验签后把同一二进制和清单重新打包成 tar 并附 SHA-256。tar 只是桌面资源的分发载体，不参与自更新：自更新只替换用户安装的独立可执行文件，`~/.local/share` 下的入口保持不变。
+
+### 发行依赖与 ABI
+
+发布二进制在 Ubuntu 24.04（x86_64 与 aarch64）上以 gnu/glibc 动态链接构建，不是 musl 静态包。
+对开发机（Arch）构建产物实测：动态依赖为 libc、libm、libgcc_s、系统 libcurl（连带 OpenSSL、nghttp2/nghttp3、ngtcp2、libssh2、krb5、psl、idn2、brotli、zstd、z、unistring、keyutils、com_err、resolv）与 libxkbcommon，不含 libwayland（wl-clipboard-rs 使用纯 Rust 后端）。该本机构建引用到 `GLIBC_2.44`，因此**不能**把它当作发行 ABI；Ubuntu 24.04 构建的符号要求以该 runner 的 glibc 2.39 为上限。运行前提：Wayland 合成器、会话 D-Bus、可用的 Vulkan 实现、系统 curl ≥ 7.85 与 CA 证书。
+
+### Linux 验证范围
+
+仓库内的 `tests/linux_smoke.py` 在私有 `dbus-daemon`、headless Sway 与临时 0700 XDG 目录中运行真实二进制：状态窗口、Rhai 刷新、Esc、`--show` 重开、Ctrl-Q、第二实例互斥、无登录时的分享错误、取消后重开与并发 Busy，并可截图留证。CI 在 Ubuntu 24.04 的 x86_64 与 aarch64 runner 上执行该冒烟测试。
+剪贴板的真实多 MIME 选择由 ignored 集成测试 `clipboard::wayland::tests::native_selection_round_trip` 在私有合成器中验证。
+本机开发环境缺少合成器与 Vulkan 运行时，GUI 冒烟未在开发机执行；KDE/wlroots 真机托盘、Dolphin 入口和手机互操作仍需要人工验收。
 
 ## 构建
 

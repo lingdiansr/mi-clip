@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Service
+MimeType=application/octet-stream;
+X-KDE-Protocols=file
+X-KDE-MinNumberOfUrls=1
+X-KDE-MaxNumberOfUrls=128
+Actions=Send;
+Icon=mi-clip
+
+[Desktop Action Send]
+Name=发送到 Mi Clip
+Exec=mi-clip --share -- %F
+Icon=mi-clip
