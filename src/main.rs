@@ -413,3 +413,59 @@ fn help() {
         "Mi Clip — standalone Xiaomi clipboard client\nClick the status icon or run without --background to see status.\n--version: print the current version\n--check-update: check and verify an update without installing\n--auth COMMAND INPUT OUTPUT: account setup and research CLI\n--check-ui: validate embedded Rhai scripts\n--probe HOST PORT: test device-info negotiation only\n{platform}\nSupports inline UTF-8 text up to 3 KiB, file clipboard offers, and native phone file sharing to ~/Downloads. No vendor runtime required."
     );
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_arguments_keep_only_durable_linux_flags() {
+        let options = parse(&[
+            OsString::from("--background"),
+            OsString::from("--config"),
+            OsString::from("relative/config.json"),
+            OsString::from("--share"),
+            OsString::from("a file.txt"),
+        ])
+        .unwrap();
+        let arguments = restart_arguments(&options, &[OsString::from("--share")]);
+        assert_eq!(arguments[0], OsString::from("--background"));
+        assert_eq!(arguments[1], OsString::from("--config"));
+        assert_eq!(
+            arguments[2],
+            std::path::absolute("relative/config.json")
+                .unwrap()
+                .into_os_string()
+        );
+        // One-shot actions and their files are never replayed after an update.
+        assert!(
+            !arguments
+                .iter()
+                .any(|value| value == "--share" || value == "a file.txt")
+        );
+        let smoke = parse(&[OsString::from("--smoke-test")]).unwrap();
+        assert_eq!(
+            restart_arguments(&smoke, &[]),
+            vec![OsString::from("--smoke-test")]
+        );
+    }
+
+    #[test]
+    fn share_and_background_cannot_both_request_a_window() {
+        assert!(
+            parse(&[
+                OsString::from("--background"),
+                OsString::from("--show"),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                OsString::from("--share"),
+                OsString::from("--"),
+                OsString::from("-dash name.txt"),
+            ])
+            .is_ok()
+        );
+    }
+}

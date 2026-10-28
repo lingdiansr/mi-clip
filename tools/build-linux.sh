@@ -35,6 +35,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Fail before touching the package when a requested release asset is absent.
+artifact=
+if [ -n "$manifest" ]; then
+    artifact="release-assets/mi-clip-linux-$arch"
+    [ -s "$artifact" ] || {
+        echo "Missing signed asset: $artifact" >&2
+        exit 1
+    }
+fi
+
 if [ -z "${MI_CLIP_SKIP_BUILD:-}" ]; then
     sh tools/build-release.sh --bin mi-clip
 fi
@@ -60,13 +70,12 @@ install -m 0644 linux/mi-clip.svg \
 install -m 0644 tools/install-linux.py "$package/install.py"
 
 if [ -n "$manifest" ]; then
-    artifact="release-assets/mi-clip-linux-$arch"
-    [ -s "$artifact" ] || {
-        echo "Missing signed asset: $artifact" >&2
-        exit 1
-    }
     # Verify the signature independently, then prove the packaged bytes match.
-    python3 tests/update_signature_test.py "$manifest" "$artifact"
+    # Any failure must leave no archive behind.
+    if ! python3 tests/update_signature_test.py "$manifest" "$artifact"; then
+        rm -rf "$package"
+        exit 1
+    fi
     if ! cmp -s "$package/bin/mi-clip" "$artifact"; then
         echo "Packaged binary differs from the signed asset." >&2
         rm -rf "$package"
